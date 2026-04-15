@@ -328,10 +328,29 @@ class GroupCoordinator:
         self.use_symmetric_memory = use_symmetric_memory
         self.is_allocation_symmetric = is_allocation_symmetric
         if is_hip():
-            from sglang.srt.distributed.device_communicators.quick_all_reduce import (
-                QuickAllReduce,
-                qr_rocm_arch_available,
-            )
+            if get_bool_env_var("SGLANG_USE_AITER_QR", default="true"):
+                try:
+                    from aiter.dist.device_communicators.quick_all_reduce import (
+                        QuickAllReduce,
+                        qr_rocm_arch_available,
+                    )
+
+                    logger.info("[QR] Using AiterQuickAllReduce (FP8 hardware codec)")
+                except ImportError as e:
+                    logger.warning(
+                        "[QR] Aiter quick allreduce not available; "
+                        "falling back to sglang QuickAllReduce. Details: %s",
+                        e,
+                    )
+                    from sglang.srt.distributed.device_communicators.quick_all_reduce import (
+                        QuickAllReduce,
+                        qr_rocm_arch_available,
+                    )
+            else:
+                from sglang.srt.distributed.device_communicators.quick_all_reduce import (
+                    QuickAllReduce,
+                    qr_rocm_arch_available,
+                )
 
         self.pynccl_comm: Optional[PyNcclCommunicator] = None
         if use_pynccl and self.world_size > 1:

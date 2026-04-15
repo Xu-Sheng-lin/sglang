@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 import triton
+import triton.language as tl
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
@@ -37,6 +38,7 @@ try:
         mla_prefill_ps_asm_fwd,
         mla_reduce_v1,
         paged_attention_ragged,
+        paged_attention_rocm,
     )
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 except ImportError:
@@ -50,6 +52,17 @@ from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
+
+
+def _build_block_tables(req_to_token, req_pool_indices, block_tables, page_size, max_num_blocks):
+    """Build block_tables from req_to_token for paged_attention_rocm.
+    Samples every page_size-th slot and divides by page_size to get block IDs.
+    """
+    # req_to_token[req_pool_indices] selects rows; [::page_size] strides by page
+    # Result: [bs, max_context_len // page_size], then truncate to max_num_blocks
+    sampled = req_to_token[req_pool_indices, ::page_size][:, :max_num_blocks]
+    block_tables.copy_((sampled // page_size).to(torch.int32))
+
 
 # Use aiter mla persist design for fp8-kv cache
 _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
@@ -89,11 +102,22 @@ class ForwardMetadata:
     reduce_partial_map: Optional[torch.Tensor] = None
     num_kv_splits: Optional[int] = None
     run_graph: Optional[bool] = True
+    # For paged_attention_rocm (non-MLA decode with block KV cache)
+    block_tables: Optional[torch.Tensor] = None
+    context_lens: Optional[torch.Tensor] = None
+    max_context_len_val: Optional[int] = None
 
 
 global_workspace_buffer = None
 
 _AITER_PARTITION_SIZE_ROCM = 256
+_GLUON_PA_PARTITION_SIZE = 512
+
+_USE_GLUON_PA = get_bool_env_var("SGLANG_USE_GLUON_PA", default="0")
+if _USE_GLUON_PA:
+    from sglang.srt.layers.attention.triton_ops.paged_attention_decode import (
+        paged_attention_decode,
+    )
 
 
 class AiterAttnBackend(AttentionBackend):
@@ -123,7 +147,16 @@ class AiterAttnBackend(AttentionBackend):
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
         self.head_dim = model_runner.model_config.head_dim
-        self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
+        """
+        # For hybrid linear models (e.g. Qwen3.5), layer 0 may not have a KV buffer
+        if (
+            model_runner.hybrid_gdn_config is not None
+            or model_runner.kimi_linear_config is not None
+        ):
+            self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
+        else:
+            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
+        """
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_attention_tp_size()
         )
@@ -164,9 +197,11 @@ class AiterAttnBackend(AttentionBackend):
                 )
 
         # aiter kernel related initialization
+        self.use_gluon_pa = _USE_GLUON_PA
+        _pa_partition_size = _GLUON_PA_PARTITION_SIZE if self.use_gluon_pa else _AITER_PARTITION_SIZE_ROCM
         self.max_num_partitions = (
-            self.max_context_len + _AITER_PARTITION_SIZE_ROCM - 1
-        ) // _AITER_PARTITION_SIZE_ROCM
+            self.max_context_len + _pa_partition_size - 1
+        ) // _pa_partition_size
 
         nbyes_per_qo_elem = torch.finfo(torch.float32).bits // 8
 
@@ -178,6 +213,64 @@ class AiterAttnBackend(AttentionBackend):
                 dtype=torch.uint8,
                 device=self.device,
             )
+
+        # Detect ROCm block KV cache pool for paged_attention_rocm
+        from sglang.srt.mem_cache.memory_pool import MHARocmBlockKVPool
+        kv_pool = model_runner.token_to_kv_pool
+        # Handle hybrid pools (e.g. HybridMHATokenToKVPool wraps full_kv_pool)
+        if hasattr(kv_pool, 'full_kv_pool'):
+            kv_pool = kv_pool.full_kv_pool
+        self.use_rocm_block_kv = isinstance(kv_pool, MHARocmBlockKVPool)
+
+        if self.use_rocm_block_kv and not self.use_mla:
+            max_num_blocks_per_seq = (
+                self.max_context_len + self.page_size - 1
+            ) // self.page_size
+            # Pre-allocate block_tables for CUDA graph compatibility
+            self.block_tables_buf = torch.zeros(
+                (max_bs, max_num_blocks_per_seq),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.context_lens_buf = torch.zeros(
+                (max_bs,), dtype=torch.int32, device=self.device
+            )
+            # Workspace for paged attention decode
+            if self.use_gluon_pa:
+                # Gluon PA: GQA-aware layout [bs, kv_heads, parts, grp_sz, ...]
+                query_grp_sz = self.num_head // self.num_kv_head
+                self.pa_rocm_tmp_output = torch.empty(
+                    (max_bs, self.num_kv_head, self.max_num_partitions, query_grp_sz, self.head_dim),
+                    dtype=model_runner.model_config.dtype,
+                    device=self.device,
+                )
+                self.pa_rocm_exp_sums = torch.empty(
+                    (max_bs, self.num_kv_head, self.max_num_partitions, query_grp_sz),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                self.pa_rocm_max_logits = torch.ones(
+                    (max_bs, self.num_kv_head, self.max_num_partitions, query_grp_sz),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+            else:
+                # HIP aiter: flat heads layout [bs, num_heads, parts, ...]
+                self.pa_rocm_tmp_output = torch.empty(
+                    (max_bs, self.num_head, self.max_num_partitions, self.head_dim),
+                    dtype=model_runner.model_config.dtype,
+                    device=self.device,
+                )
+                self.pa_rocm_exp_sums = torch.empty(
+                    (max_bs, self.num_head, self.max_num_partitions),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                self.pa_rocm_max_logits = torch.ones(
+                    (max_bs, self.num_head, self.max_num_partitions),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
 
         self.scale = float(1.0 / (self.head_dim**0.5))
         self.k_scale = self.v_scale = torch.tensor([1.0], dtype=torch.float32).to(
@@ -430,8 +523,41 @@ class AiterAttnBackend(AttentionBackend):
         num_kv_splits = None
         # num_kv_splits_indptr = None
 
+        block_tables = None
+        context_lens = None
+
+        max_context_len_val = None
         if forward_batch.forward_mode.is_decode_or_idle():
-            if spec_info is None:
+            if self.use_rocm_block_kv and not self.use_mla and spec_info is None:
+                # Build block_tables for paged_attention_rocm
+                context_lens = forward_batch.seq_lens.to(torch.int32)
+                max_seq_len = forward_batch.seq_lens.max().item()
+                max_context_len_val = max_seq_len
+                max_num_blocks = (max_seq_len + self.page_size - 1) // self.page_size
+                block_tables = self.block_tables_buf[:bs, :max_num_blocks]
+                _build_block_tables(
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    block_tables,
+                    self.page_size,
+                    max_num_blocks,
+                )
+                # Still build kv_indptr/kv_indices for potential prefill fallback
+                kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
+                kv_indptr = kv_indptr[: bs + 1]
+                kv_indices = torch.empty(
+                    forward_batch.seq_lens_sum, dtype=torch.int32, device=self.device
+                )
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
+                )
+            elif spec_info is None:
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
                 kv_indices = torch.empty(
@@ -499,6 +625,9 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_partial_map=reduce_partial_map,
                 num_kv_splits=num_kv_splits,
                 run_graph=False,
+                block_tables=block_tables,
+                context_lens=context_lens,
+                max_context_len_val=max_context_len_val,
             )
 
         elif forward_batch.forward_mode.is_draft_extend():
@@ -832,6 +961,8 @@ class AiterAttnBackend(AttentionBackend):
             qo_indptr = None
             kv_last_page_len = None
             max_q_len = None
+            block_tables = None
+            context_lens = None
 
             if spec_info is None:
                 kv_indptr = self.kv_indptr
@@ -847,6 +978,23 @@ class AiterAttnBackend(AttentionBackend):
                     kv_indices,
                     self.req_to_token.stride(0),
                 )
+                # Build block_tables for paged_attention_rocm
+                if self.use_rocm_block_kv and not self.use_mla:
+                    # Use pre-allocated buffers so CUDA graph captures stable addresses
+                    context_lens = self.context_lens_buf[:bs]
+                    context_lens.copy_(seq_lens[:bs].to(torch.int32))
+                    # Use max possible context len so CUDA graph captures enough partitions
+                    max_num_blocks = (
+                        self.max_context_len + self.page_size - 1
+                    ) // self.page_size
+                    block_tables = self.block_tables_buf[:bs, :max_num_blocks]
+                    _build_block_tables(
+                        self.req_to_token,
+                        req_pool_indices,
+                        block_tables,
+                        self.page_size,
+                        max_num_blocks,
+                    )
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
@@ -900,6 +1048,9 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_partial_map=reduce_partial_map,
                 num_kv_splits=num_kv_splits,
                 # num_kv_splits_indptr=num_kv_splits_indptr,
+                block_tables=block_tables,
+                context_lens=context_lens,
+                max_context_len_val=self.max_context_len if block_tables is not None else None,
             )
 
         elif forward_mode.is_target_verify():
@@ -1089,6 +1240,25 @@ class AiterAttnBackend(AttentionBackend):
                     kv_indices,
                     self.req_to_token.stride(0),
                 )
+                # Rebuild block_tables for paged_attention_rocm
+                if self.use_rocm_block_kv and not self.use_mla:
+                    # Use pre-allocated buffers (same addresses captured by graph)
+                    context_lens = self.context_lens_buf[:bs]
+                    context_lens.copy_(seq_lens[:bs].to(torch.int32))
+                    self.forward_metadata.context_lens = context_lens
+                    max_num_blocks = (
+                        self.max_context_len + self.page_size - 1
+                    ) // self.page_size
+                    block_tables = self.block_tables_buf[:bs, :max_num_blocks]
+                    _build_block_tables(
+                        self.req_to_token,
+                        req_pool_indices[:bs],
+                        block_tables,
+                        self.page_size,
+                        max_num_blocks,
+                    )
+                    self.forward_metadata.block_tables = block_tables
+                    self.forward_metadata.max_context_len_val = self.max_context_len
             else:
                 kv_indptr[: spec_info.kv_indptr.shape[0]] = spec_info.kv_indptr
                 kv_indices[: spec_info.kv_indices.shape[0]] = spec_info.kv_indices
@@ -1508,6 +1678,63 @@ class AiterAttnBackend(AttentionBackend):
                 raise ValueError(
                     f"Invalid forward mode for MLA prefill: {forward_batch.forward_mode=}"
                 )
+        elif self.use_rocm_block_kv:
+            # Block KV cache: 5D vectorized K, convert V for mha_batch_prefill_func
+            k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                layer.layer_id
+            )
+            # k_cache: [num_blocks, kv_heads, head_dim//vs, page_size, vs] — already 5D
+            # v_cache: [num_blocks, kv_heads, head_dim, page_size] — needs conversion
+
+            vs = 16 // v_cache.element_size()  # 8 for bf16
+            num_blocks = v_cache.shape[0]
+            kv_heads = v_cache.shape[1]
+            head_dim_v = v_cache.shape[2]
+            page_size = v_cache.shape[3]
+            # Convert V: [blocks, heads, hd, ps] -> [blocks, heads, ps//vs, hd, vs]
+            v_prefill = (
+                v_cache.reshape(num_blocks, kv_heads, head_dim_v, page_size // vs, vs)
+                .permute(0, 1, 3, 2, 4)
+                .contiguous()
+            )
+
+            # Build block_table for prefill
+            bs = forward_batch.batch_size
+            max_seq_len = forward_batch.seq_lens.max().item()
+            max_num_blocks = (max_seq_len + self.page_size - 1) // self.page_size
+            block_table = self.block_tables_buf[:bs, :max_num_blocks]
+            _build_block_tables(
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                block_table,
+                self.page_size,
+                max_num_blocks,
+            )
+            seqlen_k = forward_batch.seq_lens.to(torch.int32)
+
+            bs0 = bs + 1
+            # Use empty kv_page_indices since block_table is used
+            kv_page_indices = torch.empty(0, dtype=torch.int32, device=self.device)
+
+            o = mha_batch_prefill_func(
+                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                k_cache,
+                v_prefill,
+                self.qo_indptr[:bs0],
+                self.forward_metadata.kv_indptr[:bs0],
+                kv_page_indices,
+                self.forward_metadata.max_q_len,
+                self.forward_metadata.max_kv_len,
+                causal=True,
+                logits_soft_cap=self.logits_soft_cap,
+                alibi_slopes=None,
+                return_lse=False,
+                return_attn_probs=False,
+                block_table=block_table,
+                seqlen_k=seqlen_k,
+            )
+
+            return o.view(-1, layer.tp_q_head_num * layer.head_dim)
         else:
             k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
@@ -1616,6 +1843,64 @@ class AiterAttnBackend(AttentionBackend):
                 intra_batch_mode=intra_batch_mode,
                 num_kv_splits=num_kv_splits,
             )
+        elif self.use_rocm_block_kv and self.forward_metadata.block_tables is not None:
+            # paged_attention_rocm with x-interleaved K + transposed V cache
+            k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                layer.layer_id
+            )
+            # k_cache: [num_blocks, kv_heads, head_dim//X, page_size, X]
+            # v_cache: [num_blocks, kv_heads, head_dim, page_size]
+
+            num_seqs = q.shape[0]
+            block_tables = self.forward_metadata.block_tables
+            context_lens = self.forward_metadata.context_lens
+            block_size = self.page_size
+            max_context_len = self.forward_metadata.max_context_len_val
+
+            output = o.view(num_seqs, layer.tp_q_head_num, layer.v_head_dim)
+            query = q.view(num_seqs, layer.tp_q_head_num, layer.qk_head_dim)
+
+            # Slice workspace to current batch size
+            tmp_output = self.pa_rocm_tmp_output[:num_seqs]
+            exp_sums = self.pa_rocm_exp_sums[:num_seqs]
+            max_logits = self.pa_rocm_max_logits[:num_seqs]
+
+            if self.use_gluon_pa:
+                paged_attention_decode(
+                    output,
+                    exp_sums,
+                    max_logits,
+                    tmp_output,
+                    query,
+                    k_cache,
+                    v_cache,
+                    context_lens,
+                    block_tables,
+                    float(self.scale),
+                    max_context_len,
+                )
+            else:
+                paged_attention_rocm(
+                    output,
+                    exp_sums,
+                    max_logits,
+                    tmp_output,
+                    query,
+                    k_cache,
+                    v_cache,
+                    layer.tp_k_head_num,
+                    float(self.scale),
+                    block_tables,
+                    context_lens,
+                    block_size,
+                    max_context_len,
+                    None,               # alibi_slopes
+                    "auto",             # kv_cache_dtype
+                    self.k_scale,
+                    self.v_scale,
+                    None,               # fp8_out_scale
+                    _AITER_PARTITION_SIZE_ROCM,
+                )
         else:
             self.logits_soft_cap = layer.logit_cap
 

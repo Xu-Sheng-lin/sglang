@@ -1037,6 +1037,136 @@ class MHATokenToKVPool(KVCache):
             )
 
 
+class MHARocmBlockKVPool(MHATokenToKVPool):
+    """KV cache pool with x-interleaved K and transposed V layout for ROCm.
+
+    K buffer: [num_blocks, kv_heads, head_dim//X, page_size, X]  (X=8 for bf16)
+    V buffer: [num_blocks, kv_heads, head_dim, page_size]
+
+    This layout matches paged_attention_rocm's expected input format.
+    Writes use a Triton scatter kernel matching rtp-llm's getKLocalIdx/getVLocalIdx.
+    """
+
+    def _create_buffers(self):
+        X = 16 // self.store_dtype.itemsize  # 8 for bf16
+        total_slots = self.size + self.page_size
+        assert total_slots % self.page_size == 0, (
+            f"total_slots ({total_slots}) must be divisible by page_size ({self.page_size})"
+        )
+        num_blocks = total_slots // self.page_size
+        self._x_factor = X
+        self._num_blocks = num_blocks
+
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                # K: [num_blocks, head_num, head_dim//X, page_size, X]
+                self.k_buffer = [
+                    torch.zeros(
+                        (num_blocks, self.head_num, self.head_dim // X, self.page_size, X),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                # V: [num_blocks, head_num, head_dim, page_size]
+                self.v_buffer = [
+                    torch.zeros(
+                        (num_blocks, self.head_num, self.v_head_dim, self.page_size),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        self.data_strides = torch.tensor(
+            [
+                np.prod(x.shape[1:]) * x.dtype.itemsize
+                for x in self.k_buffer + self.v_buffer
+            ],
+            device=self.device,
+        )
+
+    def set_kv_buffer(
+        self,
+        layer: "RadixAttention",
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        if layer_id_override is not None:
+            layer_id = layer_id_override
+        else:
+            layer_id = layer.layer_id
+
+        if cache_k.dtype != self.dtype:
+            if k_scale is not None:
+                cache_k.div_(k_scale)
+            if v_scale is not None:
+                cache_v.div_(v_scale)
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.view(self.store_dtype)
+            cache_v = cache_v.view(self.store_dtype)
+
+        from sglang.srt.layers.attention.triton_ops.rocm_kv_cache import scatter_kv_cache
+
+        # cache_k/cache_v come as [N, head_num, head_dim] or [N, head_num * head_dim]
+        N = loc.shape[0]
+        k_in = cache_k.view(N, self.head_num, self.head_dim)
+        v_in = cache_v.view(N, self.head_num, self.v_head_dim)
+
+        scatter_kv_cache(
+            k_in,
+            v_in,
+            self.k_buffer[layer_id - self.start_layer],
+            self.v_buffer[layer_id - self.start_layer],
+            loc,
+        )
+
+    def get_v_head_dim(self):
+        return self.v_head_dim
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        N = tgt_loc.numel()
+        if N == 0:
+            return
+        from sglang.srt.layers.attention.triton_ops.rocm_kv_cache import (
+            gather_kv_cache,
+            scatter_kv_cache,
+        )
+        for layer_idx in range(self.layer_num):
+            k_buf = self.k_buffer[layer_idx]
+            v_buf = self.v_buffer[layer_idx]
+            # Gather from source slots into temp buffers
+            k_tmp = torch.empty(N, self.head_num, self.head_dim,
+                                dtype=self.store_dtype, device=self.device)
+            v_tmp = torch.empty(N, self.head_num, self.v_head_dim,
+                                dtype=self.store_dtype, device=self.device)
+            gather_kv_cache(k_tmp, v_tmp, k_buf, v_buf, src_loc)
+            # Scatter to target slots
+            scatter_kv_cache(k_tmp, v_tmp, k_buf, v_buf, tgt_loc)
+
+
 class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
     def _create_buffers(self):
@@ -1215,7 +1345,11 @@ class HybridLinearKVPool(KVCache):
         self.use_mla = use_mla
         if not use_mla:
 
-            TokenToKVPoolClass = MHATokenToKVPool
+            TokenToKVPoolClass = (
+                MHARocmBlockKVPool
+                if _is_hip and page_size > 1
+                else MHATokenToKVPool
+            )
 
             if _is_npu:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (

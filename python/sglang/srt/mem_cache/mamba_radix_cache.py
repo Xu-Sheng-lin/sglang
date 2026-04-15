@@ -380,10 +380,8 @@ class MambaRadixCache(BasePrefixCache):
         self.disable = params.disable
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
 
-        if not self.enable_mamba_extra_buffer:
-            assert (
-                self.page_size == 1
-            ), f"Page size must be 1 for MambaRadixCache v1, got {self.page_size}"
+        # page_size > 1 is supported: key matching uses _key_match_paged,
+        # and Mamba state management is independent of page_size.
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -494,6 +492,15 @@ class MambaRadixCache(BasePrefixCache):
 
             if self.page_size != 1:
                 page_aligned_len = len(kv_indices) // self.page_size * self.page_size
+                # In v1 (non-extra-buffer) mode, cache_len may not be page-aligned.
+                # Truncate to page boundary and free excess tokens.
+                if cache_len > page_aligned_len:
+                    self.token_to_kv_pool_allocator.free(
+                        kv_indices[page_aligned_len:cache_len]
+                    )
+                    kv_indices = kv_indices[:page_aligned_len]
+                    token_ids = token_ids[:page_aligned_len]
+                    cache_len = page_aligned_len
                 page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
                     dtype=torch.int64, copy=True
                 )
@@ -581,6 +588,10 @@ class MambaRadixCache(BasePrefixCache):
         kv_indices = kv_indices_orig[:cache_len]
         if self.page_size != 1:
             page_aligned_len = len(kv_indices) // self.page_size * self.page_size
+            # In v1 mode, cache_len may not be page-aligned. Truncate.
+            if page_aligned_len < len(kv_indices):
+                kv_indices = kv_indices[:page_aligned_len]
+                cache_len = page_aligned_len
             page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
                 dtype=torch.int64, copy=True
             )

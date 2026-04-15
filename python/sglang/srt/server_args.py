@@ -2054,7 +2054,10 @@ class ServerArgs:
 
     def _handle_page_size(self):
         if self.page_size is None:
-            self.page_size = 1
+            if is_hip():
+                self.page_size = 16
+            else:
+                self.page_size = 1
 
     def _handle_amd_specifics(self):
         if is_hip():
