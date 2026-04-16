@@ -1679,59 +1679,47 @@ class AiterAttnBackend(AttentionBackend):
                     f"Invalid forward mode for MLA prefill: {forward_batch.forward_mode=}"
                 )
         elif self.use_rocm_block_kv:
-            # Block KV cache: 5D vectorized K, convert V for mha_batch_prefill_func
+            # Block KV cache: gather from 5D layout to [N, kv_heads, head_dim]
+            # Use flash_attn_varlen_func instead of mha_batch_prefill_func
+            # to work around non-deterministic output bug in mha_batch_prefill_func
             k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
-            # k_cache: [num_blocks, kv_heads, head_dim//vs, page_size, vs] — already 5D
-            # v_cache: [num_blocks, kv_heads, head_dim, page_size] — needs conversion
+            # k_cache: [num_blocks, kv_heads, head_dim//vs, page_size, vs]
+            # v_cache: [num_blocks, kv_heads, head_dim, page_size]
 
-            vs = 16 // v_cache.element_size()  # 8 for bf16
-            num_blocks = v_cache.shape[0]
-            kv_heads = v_cache.shape[1]
-            head_dim_v = v_cache.shape[2]
-            page_size = v_cache.shape[3]
-            # Convert V: [blocks, heads, hd, ps] -> [blocks, heads, ps//vs, hd, vs]
-            v_prefill = (
-                v_cache.reshape(num_blocks, kv_heads, head_dim_v, page_size // vs, vs)
-                .permute(0, 1, 3, 2, 4)
-                .contiguous()
+            from sglang.srt.layers.attention.triton_ops.rocm_kv_cache import (
+                gather_kv_cache,
             )
 
-            # Build block_table for prefill
             bs = forward_batch.batch_size
-            max_seq_len = forward_batch.seq_lens.max().item()
-            max_num_blocks = (max_seq_len + self.page_size - 1) // self.page_size
-            block_table = self.block_tables_buf[:bs, :max_num_blocks]
-            _build_block_tables(
-                self.req_to_token,
-                forward_batch.req_pool_indices,
-                block_table,
-                self.page_size,
-                max_num_blocks,
-            )
-            seqlen_k = forward_batch.seq_lens.to(torch.int32)
-
             bs0 = bs + 1
-            # Use empty kv_page_indices since block_table is used
-            kv_page_indices = torch.empty(0, dtype=torch.int32, device=self.device)
+            kv_indices = self.forward_metadata.kv_indices
+            total_kv = kv_indices.shape[0]
+            kv_heads = k_cache.shape[1]
 
-            o = mha_batch_prefill_func(
+            k_gathered = torch.empty(
+                (total_kv, kv_heads, layer.head_dim),
+                dtype=k_cache.dtype,
+                device=self.device,
+            )
+            v_gathered = torch.empty(
+                (total_kv, kv_heads, layer.head_dim),
+                dtype=v_cache.dtype,
+                device=self.device,
+            )
+            gather_kv_cache(k_gathered, v_gathered, k_cache, v_cache, kv_indices)
+
+            o = flash_attn_varlen_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                k_cache,
-                v_prefill,
+                k_gathered,
+                v_gathered,
                 self.qo_indptr[:bs0],
                 self.forward_metadata.kv_indptr[:bs0],
-                kv_page_indices,
                 self.forward_metadata.max_q_len,
                 self.forward_metadata.max_kv_len,
+                softmax_scale=layer.scaling,
                 causal=True,
-                logits_soft_cap=self.logits_soft_cap,
-                alibi_slopes=None,
-                return_lse=False,
-                return_attn_probs=False,
-                block_table=block_table,
-                seqlen_k=seqlen_k,
             )
 
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -1748,20 +1736,21 @@ class AiterAttnBackend(AttentionBackend):
                 k_cache = k_cache.to(dtype)
                 v_cache = v_cache.to(dtype)
 
-            o = mha_batch_prefill_func(
+            # Use flash_attn_varlen_func instead of mha_batch_prefill_func
+            # to work around non-deterministic output bug in mha_batch_prefill_func
+            kv_indices = self.forward_metadata.kv_indices
+            k_gathered = k_cache[kv_indices]
+            v_gathered = v_cache[kv_indices]
+            o = flash_attn_varlen_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                k_cache,
-                v_cache,
+                k_gathered,
+                v_gathered,
                 self.qo_indptr[:bs0],
                 self.forward_metadata.kv_indptr[:bs0],
-                self.forward_metadata.kv_indices,
                 self.forward_metadata.max_q_len,
                 self.forward_metadata.max_kv_len,
+                softmax_scale=layer.scaling,
                 causal=True,
-                logits_soft_cap=self.logits_soft_cap,
-                alibi_slopes=None,
-                return_lse=False,
-                return_attn_probs=False,
             )
 
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -1775,7 +1764,6 @@ class AiterAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
-
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
         if layer.qk_head_dim != layer.v_head_dim:
