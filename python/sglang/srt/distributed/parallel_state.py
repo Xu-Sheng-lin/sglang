@@ -383,20 +383,27 @@ class GroupCoordinator:
                     "warning, specify --disable-custom-all-reduce explicitly."
                 )
 
-            if is_hip():
-                try:
-                    # Initialize a custom quick all-reduce implementation for AMD
-                    # when rocm >= gfx942. Quick reduce is designed as a
-                    # complement to custom allreduce.
-                    # Based on quickreduce (https://github.com/mk1-project/quickreduce).
-                    if qr_rocm_arch_available():
-                        self.qr_comm = QuickAllReduce(
-                            group=self.cpu_group, device=self.device
+        # Initialize QuickAllReduce independently of CustomAllreduce.
+        # QR is a complement to CA, but can also serve as the sole fast
+        # allreduce path when CA is disabled (e.g. due to precision issues).
+        if is_hip() and self.world_size > 1:
+            try:
+                if qr_rocm_arch_available():
+                    self.qr_comm = QuickAllReduce(
+                        group=self.cpu_group, device=self.device
+                    )
+                    if not use_custom_allreduce:
+                        logger.info(
+                            "[AR] Custom allreduce disabled; "
+                            "QuickAllReduce active as fallback"
                         )
-                except Exception as e:
-                    logger.warning(f"Failed to initialize QuickAllReduce: {e}")
-        elif self.world_size > 1 and is_hip():
-            logger.info("[AR] All-reduce call path: NCCL (custom AR disabled)")
+            except Exception as e:
+                logger.warning(f"Failed to initialize QuickAllReduce: {e}")
+                if not use_custom_allreduce:
+                    logger.info(
+                        "[AR] All-reduce call path: NCCL "
+                        "(custom AR disabled, QR init failed)"
+                    )
 
         self.torch_symm_mem_comm: Optional[TorchSymmMemCommunicator] = None
         if self.use_torch_symm_mem_all_reduce and self.world_size > 1:
@@ -608,16 +615,29 @@ class GroupCoordinator:
                 return input_
 
         outplace_all_reduce_method = None
-        if (
+        ca_available = (
             self.ca_comm is not None
             and not self.ca_comm.disabled
-            and self.ca_comm.should_custom_ar(input_)
-        ):
+        )
+        if ca_available and self.ca_comm.should_custom_ar(input_):
             outplace_all_reduce_method = "ca"
         elif (
             self.qr_comm is not None
             and not self.qr_comm.disabled
-            and self.qr_comm.should_quick_allreduce(input_)
+            and (
+                self.qr_comm.should_quick_allreduce(input_)
+                # When CA is unavailable, relax QR min-size gate so QR
+                # covers small decode tensors that would otherwise fall
+                # back to slow NCCL.  Only basic requirements are checked:
+                # supported dtype, 16-byte alignment, within max buffer.
+                or (
+                    not ca_available
+                    and input_.dtype in self.qr_comm._SUPPORTED_DTYPES
+                    and (input_.numel() * input_.element_size()) % 16 == 0
+                    and (input_.numel() * input_.element_size())
+                    <= self.qr_comm.qr_max_size
+                )
+            )
         ):
             outplace_all_reduce_method = "qr"
         elif (
