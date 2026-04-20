@@ -245,6 +245,15 @@ class MambaAttnBackendBase(AttentionBackend):
             forward_batch.req_pool_indices
         )
 
+        # Backport of upstream PR #20522: compute once, reuse via metadata.
+        # `mamba_track_mask.any()` is an implicit D->H sync; collapsing it to a
+        # single host-side bool here lets every later call site read the cached
+        # flag instead of re-syncing the GPU stream.
+        has_mamba_track_mask = bool(
+            forward_batch.mamba_track_mask is not None
+            and forward_batch.mamba_track_mask.any()
+        )
+
         if forward_batch.forward_mode.is_decode_or_idle():
             query_start_loc = torch.arange(
                 0, bs + 1, dtype=torch.int32, device=self.device
@@ -274,10 +283,7 @@ class MambaAttnBackendBase(AttentionBackend):
                     forward_batch.extend_start_loc[-1]
                     + forward_batch.extend_seq_lens[-1]
                 )
-                if (
-                    forward_batch.mamba_track_mask is not None
-                    and forward_batch.mamba_track_mask.any()
-                ):
+                if has_mamba_track_mask:
                     track_conv_indices = self._init_track_conv_indices(
                         query_start_loc, forward_batch
                     )
@@ -302,6 +308,7 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_h_dst=track_ssm_h_dst,
             track_ssm_final_src=track_ssm_final_src,
             track_ssm_final_dst=track_ssm_final_dst,
+            has_mamba_track_mask=has_mamba_track_mask,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -653,10 +660,7 @@ class MambaAttnBackendBase(AttentionBackend):
         Note: Conv state tracking for extend is handled separately via gather operations
         using indices computed by `_init_track_conv_indices`.
         """
-        if (
-            forward_batch.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask.any()
-        ):
+        if forward_metadata.has_mamba_track_mask:
             h = h.squeeze(0)
 
             if forward_metadata.track_ssm_h_src.numel() > 0:
@@ -867,6 +871,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
             else fused_sigmoid_gating_delta_rule_update
         )
 
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata(forward_batch)
+        # Backport of upstream PR #20522: precompute mask-derived indices once
+        # so forward_extend doesn't have to call `.nonzero()` (D->H sync) every
+        # layer.
+        if self.forward_metadata.has_mamba_track_mask:
+            self.forward_metadata.mamba_track_mask_indices = (
+                forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
+            )
+            self.forward_metadata.conv_states_mask_indices = (
+                forward_batch.mamba_track_indices[
+                    self.forward_metadata.mamba_track_mask_indices
+                ]
+            )
+
     def forward_decode(
         self,
         layer: RadixLinearAttention,
@@ -1000,19 +1019,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
-            if (
-                forward_batch.mamba_track_mask is not None
-                and forward_batch.mamba_track_mask.any()
-            ):
-                conv_dst = forward_batch.mamba_track_indices
+            if forward_metadata.has_mamba_track_mask:
                 # Gather all slices at once: [:, track_conv_indices] -> [d, num_masked, slice_len]
                 # track_conv_indices is already filtered and clamped in _init_track_conv_indices
                 mixed_qkv_to_track = mixed_qkv[
                     :, forward_metadata.track_conv_indices
                 ].transpose(0, 1)
-                # Apply mask and assign to destinations
-                mask_indices = forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
-                conv_states[conv_dst[mask_indices]] = mixed_qkv_to_track
+                conv_states[forward_metadata.conv_states_mask_indices] = (
+                    mixed_qkv_to_track
+                )
 
             if _is_hip:
                 query, key, value = causal_conv1d_fn_split_qkv(
