@@ -31,16 +31,16 @@ def _scatter_kv_cache_kernel(
     Grid: (N, kv_heads)
     Each program writes one (token, head) pair — head_dim elements for both K and V.
     """
-    token_idx = tl.program_id(0)
-    head_idx = tl.program_id(1)
+    token_idx = tl.program_id(0).to(tl.int64)
+    head_idx = tl.program_id(1).to(tl.int64)
 
-    slot_id = tl.load(SLOT_IDS + token_idx)
+    slot_id = tl.load(SLOT_IDS + token_idx).to(tl.int64)
     block_id = slot_id // block_size
     pos = slot_id % block_size
 
     # Source: K_SRC[token_idx, head_idx, :] and V_SRC[token_idx, head_idx, :]
     src_base = token_idx * kv_heads * head_dim + head_idx * head_dim
-    dims = tl.arange(0, BLOCK_D)
+    dims = tl.arange(0, BLOCK_D).to(tl.int64)
     mask = dims < head_dim
 
     # Load source K and V
@@ -48,19 +48,15 @@ def _scatter_kv_cache_kernel(
     v_vals = tl.load(V_SRC + src_base + dims, mask=mask)
 
     # K cache strides: [num_blocks, kv_heads, head_dim//X, block_size, X]
-    #   block_stride = kv_heads * head_dim  (since head_dim//X * block_size * X = head_dim * block_size... no)
-    #   Actually: per-block-head size = (head_dim // X) * block_size * X = head_dim * block_size
-    k_per_block_head = head_dim * block_size  # = (head_dim // X) * block_size * X
+    k_per_block_head = tl.cast(head_dim * block_size, tl.int64)
     k_base = block_id * (kv_heads * k_per_block_head) + head_idx * k_per_block_head
 
     # K offset: dim_group * block_size * X + pos * X + dim_in_group
-    # where dim_group = dims // X, dim_in_group = dims % X
     k_offsets = (dims // X) * (block_size * X) + pos * X + (dims % X)
     tl.store(K_CACHE + k_base + k_offsets, k_vals, mask=mask)
 
     # V cache strides: [num_blocks, kv_heads, head_dim, block_size]
-    #   per-block-head size = head_dim * block_size
-    v_per_block_head = head_dim * block_size
+    v_per_block_head = tl.cast(head_dim * block_size, tl.int64)
     v_base = block_id * (kv_heads * v_per_block_head) + head_idx * v_per_block_head
 
     # V offset: dim * block_size + pos
@@ -82,26 +78,26 @@ def _gather_kv_cache_kernel(
     BLOCK_D: tl.constexpr,
 ):
     """Gather K/V from x-interleaved/transposed cache to [N, kv_heads, head_dim]."""
-    token_idx = tl.program_id(0)
-    head_idx = tl.program_id(1)
+    token_idx = tl.program_id(0).to(tl.int64)
+    head_idx = tl.program_id(1).to(tl.int64)
 
-    slot_id = tl.load(SLOT_IDS + token_idx)
+    slot_id = tl.load(SLOT_IDS + token_idx).to(tl.int64)
     block_id = slot_id // block_size
     pos = slot_id % block_size
 
     dst_base = token_idx * kv_heads * head_dim + head_idx * head_dim
-    dims = tl.arange(0, BLOCK_D)
+    dims = tl.arange(0, BLOCK_D).to(tl.int64)
     mask = dims < head_dim
 
     # K cache
-    k_per_block_head = head_dim * block_size
+    k_per_block_head = tl.cast(head_dim * block_size, tl.int64)
     k_base = block_id * (kv_heads * k_per_block_head) + head_idx * k_per_block_head
     k_offsets = (dims // X) * (block_size * X) + pos * X + (dims % X)
     k_vals = tl.load(K_CACHE + k_base + k_offsets, mask=mask)
     tl.store(K_DST + dst_base + dims, k_vals, mask=mask)
 
     # V cache
-    v_per_block_head = head_dim * block_size
+    v_per_block_head = tl.cast(head_dim * block_size, tl.int64)
     v_base = block_id * (kv_heads * v_per_block_head) + head_idx * v_per_block_head
     v_offsets = dims * block_size + pos
     v_vals = tl.load(V_CACHE + v_base + v_offsets, mask=mask)
