@@ -109,6 +109,8 @@ QWEN3_5_PACKED_MODULES_MAPPING = {
     "qkv_proj": ["q_proj", "k_proj", "v_proj"],
     "gate_up_proj": ["gate_proj", "up_proj"],
     "in_proj_fused": ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"],
+    "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+    "in_proj_ba": ["in_proj_b", "in_proj_a"],
 }
 
 
@@ -118,6 +120,31 @@ def _skip_linear_attn_ba_fp8_quant(
     # Qwen3.5 FP8 checkpoints and RTP both keep linear_attn ba weights in BF16.
     # Quantizing them online also hits unsupported AITER PTPC small-N GEMM shapes.
     return quant_config is not None and quant_config.get_name() == "fp8"
+
+
+def _append_linear_attn_packed_params_mapping(
+    stacked_params_mapping, params_dict
+) -> None:
+    if any("in_proj_fused." in k for k in params_dict):
+        stacked_params_mapping += [
+            ("in_proj_fused.", "in_proj_qkv.", (0, 1, 2)),
+            ("in_proj_fused.", "in_proj_z.", 3),
+            ("in_proj_fused.", "in_proj_b.", 4),
+            ("in_proj_fused.", "in_proj_a.", 5),
+        ]
+        return
+
+    if any("in_proj_qkvz." in k for k in params_dict):
+        stacked_params_mapping += [
+            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
+            ("in_proj_qkvz.", "in_proj_z.", 3),
+        ]
+
+    if any("in_proj_ba." in k for k in params_dict):
+        stacked_params_mapping += [
+            ("in_proj_ba.", "in_proj_b.", 0),
+            ("in_proj_ba.", "in_proj_a.", 1),
+        ]
 
 
 class Qwen3_5SparseMoeBlock(Qwen2MoeSparseMoeBlock):
@@ -183,8 +210,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
-        # HIP BF16 full fusion: single GEMM for qkv+z+b+a
-        # FP8/quantized or non-HIP: two GEMMs (qkvz + ba)
+        # HIP BF16 full fusion: single GEMM for qkv+z+b+a.
+        # FP8/quantized or non-HIP: two GEMMs (qkvz + BF16 ba).
         self._hip_bf16_full_fuse = _is_hip and quant_config is None
 
         if self._hip_bf16_full_fuse:
@@ -206,45 +233,35 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             self._bind_packed_weight_loaders(self.in_proj_fused)
         else:
-            self.in_proj_qkv = MergedColumnParallelLinear(
+            self.in_proj_qkvz = MergedColumnParallelLinear(
                 input_size=self.hidden_size,
-                output_sizes=[self.key_dim, self.key_dim, self.value_dim],
+                output_sizes=[
+                    self.key_dim,
+                    self.key_dim,
+                    self.value_dim,
+                    self.value_dim,
+                ],
                 bias=False,
                 quant_config=quant_config,
                 tp_rank=self.attn_tp_rank,
                 tp_size=self.attn_tp_size,
-                prefix=add_prefix("in_proj_qkv", prefix),
+                prefix=add_prefix("in_proj_qkvz", prefix),
             )
-            self.in_proj_z = ColumnParallelLinear(
-                input_size=self.hidden_size,
-                output_size=self.value_dim,
-                bias=False,
-                quant_config=quant_config,
-                tp_rank=self.attn_tp_rank,
-                tp_size=self.attn_tp_size,
-                prefix=add_prefix("in_proj_z", prefix),
-            )
+            self._bind_packed_weight_loaders(self.in_proj_qkvz)
+
             ba_quant_config = (
                 None if _skip_linear_attn_ba_fp8_quant(quant_config) else quant_config
             )
-            self.in_proj_b = ColumnParallelLinear(
+            self.in_proj_ba = MergedColumnParallelLinear(
                 input_size=self.hidden_size,
-                output_size=self.num_v_heads,
+                output_sizes=[self.num_v_heads, self.num_v_heads],
                 bias=False,
                 quant_config=ba_quant_config,
                 tp_rank=self.attn_tp_rank,
                 tp_size=self.attn_tp_size,
-                prefix=add_prefix("in_proj_b", prefix),
+                prefix=add_prefix("in_proj_ba", prefix),
             )
-            self.in_proj_a = ColumnParallelLinear(
-                input_size=self.hidden_size,
-                output_size=self.num_v_heads,
-                bias=False,
-                quant_config=ba_quant_config,
-                tp_rank=self.attn_tp_rank,
-                tp_size=self.attn_tp_size,
-                prefix=add_prefix("in_proj_a", prefix),
-            )
+            self._bind_packed_weight_loaders(self.in_proj_ba)
 
         self._qkv_size_local = (
             self.key_dim // self.attn_tp_size * 2
@@ -419,14 +436,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             fused_out, _ = self.in_proj_fused(hidden_states)
             return fused_out, None, None, None
 
-        mixed_qkv, _ = self.in_proj_qkv(hidden_states)
-        z, _ = self.in_proj_z(hidden_states)
-        z = z.reshape(z.size(0), -1, self.head_v_dim)
-        b, _ = self.in_proj_b(hidden_states)
-        a, _ = self.in_proj_a(hidden_states)
-        b = b.contiguous()
-        a = a.contiguous()
-        return mixed_qkv, z, b, a
+        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+        mixed_ba, _ = self.in_proj_ba(hidden_states)
+        return mixed_qkvz, mixed_ba, None, None
 
     def forward(
         self,
@@ -478,6 +490,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 b = fused_out[:, z_end:b_end].contiguous()
                 a = fused_out[:, b_end:a_end].contiguous()
             z = z.reshape(hidden_states.size(0), -1, self.head_v_dim)
+        else:
+            mixed_qkvz = mixed_qkv
+            mixed_ba = z
+            qkv_end = self._qkv_size_local
+            z_end = qkv_end + self._z_size_local
+            mixed_qkv = mixed_qkvz[:, :qkv_end]
+            z = mixed_qkvz[:, qkv_end:z_end]
+            z = z.reshape(hidden_states.size(0), -1, self.head_v_dim)
+            b = mixed_ba[:, : self._ba_size_local].contiguous()
+            a = mixed_ba[:, self._ba_size_local :].contiguous()
         core_attn_out = self.attn(
             forward_batch,
             mixed_qkv=mixed_qkv,
@@ -1004,8 +1026,6 @@ class Qwen3_5ForCausalLM(nn.Module):
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
-        use_fused_gdn = any("in_proj_fused." in k for k in params_dict)
-
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1014,13 +1034,9 @@ class Qwen3_5ForCausalLM(nn.Module):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-        if use_fused_gdn:
-            stacked_params_mapping += [
-                ("in_proj_fused.", "in_proj_qkv.", (0, 1, 2)),
-                ("in_proj_fused.", "in_proj_z.", 3),
-                ("in_proj_fused.", "in_proj_b.", 4),
-                ("in_proj_fused.", "in_proj_a.", 5),
-            ]
+        _append_linear_attn_packed_params_mapping(
+            stacked_params_mapping, params_dict
+        )
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -1083,8 +1099,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
-        use_fused_gdn = any("in_proj_fused." in k for k in params_dict)
-
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1093,13 +1107,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-        if use_fused_gdn:
-            stacked_params_mapping += [
-                ("in_proj_fused.", "in_proj_qkv.", (0, 1, 2)),
-                ("in_proj_fused.", "in_proj_z.", 3),
-                ("in_proj_fused.", "in_proj_b.", 4),
-                ("in_proj_fused.", "in_proj_a.", 5),
-            ]
+        _append_linear_attn_packed_params_mapping(
+            stacked_params_mapping, params_dict
+        )
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
@@ -1308,8 +1318,6 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
-        use_fused_gdn = any("in_proj_fused." in k for k in params_dict)
-
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1318,13 +1326,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-        if use_fused_gdn:
-            stacked_params_mapping += [
-                ("in_proj_fused.", "in_proj_qkv.", (0, 1, 2)),
-                ("in_proj_fused.", "in_proj_z.", 3),
-                ("in_proj_fused.", "in_proj_b.", 4),
-                ("in_proj_fused.", "in_proj_a.", 5),
-            ]
+        _append_linear_attn_packed_params_mapping(
+            stacked_params_mapping, params_dict
+        )
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -1407,8 +1411,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
-        use_fused_gdn = any("in_proj_fused." in k for k in params_dict)
-
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1417,13 +1419,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-        if use_fused_gdn:
-            stacked_params_mapping += [
-                ("in_proj_fused.", "in_proj_qkv.", (0, 1, 2)),
-                ("in_proj_fused.", "in_proj_z.", 3),
-                ("in_proj_fused.", "in_proj_b.", 4),
-                ("in_proj_fused.", "in_proj_a.", 5),
-            ]
+        _append_linear_attn_packed_params_mapping(
+            stacked_params_mapping, params_dict
+        )
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
