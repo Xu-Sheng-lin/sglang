@@ -58,8 +58,11 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     import aiter
 
-    # from aiter import gemm_a8w8_blockscale, gemm_a8w8_bpreshuffle, get_hip_quant
-    from aiter import gemm_a8w8_bpreshuffle, get_hip_quant
+    from aiter import (
+        gemm_a8w8_blockscale_bpreshuffle,
+        gemm_a8w8_bpreshuffle,
+        get_hip_quant,
+    )
     from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
@@ -94,6 +97,19 @@ def use_rowwise_torch_scaled_mm():
 
 
 USE_ROWWISE_TORCH_SCALED_MM = use_rowwise_torch_scaled_mm()
+
+
+def use_aiter_block_fp8_bpreshuffle() -> bool:
+    return _use_aiter and get_bool_env_var("SGLANG_ROCM_USE_AITER_LINEAR_FP8HIPB")
+
+
+@lru_cache(maxsize=1)
+def warn_aiter_block_fp8_bpreshuffle_unavailable() -> None:
+    logger.warning(
+        "SGLANG_ROCM_USE_AITER_LINEAR_FP8HIPB=1 was set for block FP8 linear, "
+        "but the weight is not marked as pre-shuffled. Falling back to "
+        "aiter Triton gemm_a8w8_blockscale for this call."
+    )
 
 
 @lru_cache(maxsize=1)
@@ -560,6 +576,7 @@ def aiter_w8a8_block_fp8_linear(
     # assert input_scale is None
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
+    output_dtype = torch.bfloat16 if input_scale is not None else input.dtype
 
     # if input_scale not None, input is quanted
     if input_scale is not None:
@@ -569,20 +586,39 @@ def aiter_w8a8_block_fp8_linear(
     else:
         q_input, x_scale = aiter_per1x128_quant(input_2d, quant_dtype=aiter.dtypes.fp8)
 
-    output = gemm_a8w8_blockscale(
-        q_input,
-        weight,
-        x_scale,
-        weight_scale,
-        dtype=torch.bfloat16 if input_scale is not None else input.dtype,
-    )
+    if getattr(weight, "is_shuffled", False):
+        # AITER blockscale bpreshuffle expects x_scale in the same logical
+        # shape but column-major memory order, matching AITER's own tests.
+        x_scale = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
+        output = gemm_a8w8_blockscale_bpreshuffle(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            dtype=output_dtype,
+        )
+    elif use_aiter_block_fp8_bpreshuffle():
+        warn_aiter_block_fp8_bpreshuffle_unavailable()
+        output = gemm_a8w8_blockscale(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            dtype=output_dtype,
+        )
+    else:
+        output = gemm_a8w8_blockscale(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            dtype=output_dtype,
+        )
 
     if bias is not None:
         output += bias
 
-    return output.to(
-        dtype=torch.bfloat16 if input_scale is not None else input_2d.dtype
-    ).view(*output_shape)
+    return output.to(dtype=output_dtype).view(*output_shape)
 
 
 def triton_w8a8_block_fp8_linear(

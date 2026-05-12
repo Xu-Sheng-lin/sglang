@@ -54,6 +54,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
     requant_weight_ue8m0_inplace,
     triton_mxfp8_blockscaled_linear,
+    use_aiter_block_fp8_bpreshuffle,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import (
@@ -460,8 +461,15 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.weight_scale_inv.format_ue8m0 = True
             weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
 
+        if use_aiter_block_fp8_bpreshuffle():
+            if not getattr(layer.weight, "is_shuffled", False):
+                weight = shuffle_weight(weight.contiguous(), (16, 16))
+            weight.is_shuffled = True
+
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data
+        if use_aiter_block_fp8_bpreshuffle():
+            layer.weight.is_shuffled = True
 
     def _quantize_mxfp8_weights(self, layer: Module) -> None:
         weight = layer.weight.data
