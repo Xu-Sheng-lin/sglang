@@ -32,6 +32,7 @@ from sglang.srt.layers.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
+from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -107,6 +108,111 @@ if _use_aiter or _use_hip_int4:
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
+
+
+class LoadTimeFp8LinearWeightParameter(ModelWeightParameter):
+    """Load BF16/FP16 linear shards directly into FP8 PTPC storage."""
+
+    def __init__(self, weight_scale: Parameter, **kwargs):
+        self._load_time_fp8_weight_scale = weight_scale
+        super().__init__(**kwargs)
+        self.load_time_fp8_quant = True
+
+    def _load_fp8_shard(
+        self,
+        param_data: torch.Tensor,
+        loaded_weight: torch.Tensor,
+        scale_offset: int,
+    ) -> None:
+        if len(loaded_weight.shape) == 0:
+            loaded_weight = loaded_weight.reshape(1)
+        assert (
+            param_data.shape == loaded_weight.shape
+        ), f"{param_data.shape=}, {loaded_weight.shape=}"
+        if loaded_weight.device != param_data.device:
+            loaded_weight = loaded_weight.to(param_data.device, non_blocking=True)
+        qweight, weight_scale = per_token_group_quant_fp8(
+            loaded_weight.contiguous(), loaded_weight.shape[-1]
+        )
+        param_data.copy_(qweight)
+        weight_scale = weight_scale.t().contiguous()
+        scale_data = self._load_time_fp8_weight_scale.data
+        scale_data.narrow(1, scale_offset, weight_scale.shape[1]).copy_(weight_scale)
+
+    def load_column_parallel_weight(
+        self,
+        loaded_weight: torch.Tensor,
+        tp_rank: int,
+        use_presharded_weights: bool = False,
+    ):
+        param_data = self.data
+        if not use_presharded_weights:
+            shard_size = param_data.shape[self.output_dim]
+            loaded_weight = loaded_weight.narrow(
+                self.output_dim, tp_rank * shard_size, shard_size
+            )
+        self._load_fp8_shard(param_data, loaded_weight, 0)
+
+    def load_row_parallel_weight(
+        self,
+        loaded_weight: torch.Tensor,
+        tp_rank: int,
+        use_presharded_weights: bool = False,
+    ):
+        param_data = self.data
+        if not use_presharded_weights:
+            shard_size = param_data.shape[self.input_dim]
+            start_idx = tp_rank * shard_size
+            end_idx = start_idx + shard_size
+            if end_idx > loaded_weight.shape[self.input_dim]:
+                loaded_weight = pad_or_narrow_weight(
+                    loaded_weight, self.input_dim, start_idx, shard_size
+                )
+            else:
+                loaded_weight = loaded_weight.narrow(
+                    self.input_dim, start_idx, shard_size
+                )
+        self._load_fp8_shard(param_data, loaded_weight, 0)
+
+    def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
+        shard_offset = kwargs.get("shard_offset")
+        shard_size = kwargs.get("shard_size")
+        tp_rank = kwargs.get("tp_rank")
+        use_presharded_weights = kwargs.get("use_presharded_weights")
+
+        param_data = self.data.narrow(self.output_dim, shard_offset, shard_size)
+        if not use_presharded_weights:
+            start_idx = tp_rank * shard_size
+            end_idx = start_idx + shard_size
+            if end_idx > loaded_weight.shape[self.output_dim]:
+                loaded_weight = pad_or_narrow_weight(
+                    loaded_weight, self.output_dim, start_idx, shard_size
+                )
+            else:
+                loaded_weight = loaded_weight.narrow(
+                    self.output_dim, start_idx, shard_size
+                )
+        self._load_fp8_shard(param_data, loaded_weight, shard_offset)
+
+    def load_qkv_weight(
+        self,
+        loaded_weight: torch.Tensor,
+        tp_rank: int,
+        use_presharded_weights: bool = False,
+        **kwargs,
+    ):
+        shard_offset = kwargs.get("shard_offset")
+        shard_size = kwargs.get("shard_size")
+        shard_id = kwargs.get("shard_id")
+        num_heads = kwargs.get("num_heads")
+
+        param_data = self.data.narrow(self.output_dim, shard_offset, shard_size)
+        shard_id = tp_rank if shard_id == "q" else tp_rank // num_heads
+        if not use_presharded_weights:
+            loaded_weight = loaded_weight.narrow(
+                self.output_dim, shard_id * shard_size, shard_size
+            )
+        self._load_fp8_shard(param_data, loaded_weight, shard_offset)
 
 
 class Fp8Config(QuantizationConfig):
@@ -263,6 +369,12 @@ class Fp8LinearMethod(LinearMethodBase):
             self.quant_config.is_checkpoint_fp8_serialized
         )
         self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
+        self.use_load_time_quantization = (
+            _use_aiter
+            and self.use_aiter_fp8_per_token
+            and not self.is_checkpoint_fp8_serialized
+            and not self.block_quant
+        )
         self.use_per_token_if_dynamic = False
 
     def validate_block_quant_shapes(
@@ -336,18 +448,56 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         # Create the weight
-        weight_dtype = (
-            torch.float8_e4m3fn if self.is_checkpoint_fp8_serialized else params_dtype
+        load_time_supported_layers = {
+            "ColumnParallelLinear",
+            "MergedColumnParallelLinear",
+            "QKVParallelLinear",
+            "RowParallelLinear",
+        }
+        use_load_time_quantization = (
+            self.use_load_time_quantization
+            and layer.__class__.__name__ in load_time_supported_layers
         )
-        weight = ModelWeightParameter(
-            data=torch.empty(
-                output_size_per_partition, input_size_per_partition, dtype=weight_dtype
-            ),
-            input_dim=1,
-            output_dim=0,
-            weight_loader=weight_loader,
-        )
+        if use_load_time_quantization:
+            weight_dtype = fp8_dtype
+            load_time_weight_scale = Parameter(
+                torch.empty(1, output_size_per_partition, dtype=torch.float32),
+                requires_grad=False,
+            )
+            weight = LoadTimeFp8LinearWeightParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition,
+                    dtype=weight_dtype,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_scale=load_time_weight_scale,
+                weight_loader=weight_loader,
+            )
+        else:
+            weight_dtype = (
+                torch.float8_e4m3fn
+                if self.is_checkpoint_fp8_serialized
+                else params_dtype
+            )
+            load_time_weight_scale = None
+            weight = ModelWeightParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition,
+                    dtype=weight_dtype,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
         layer.register_parameter("weight", weight)
+
+        if use_load_time_quantization:
+            layer.register_parameter("weight_scale", load_time_weight_scale)
+            layer.register_parameter("input_scale", None)
+            return
 
         # If checkpoint is serialized fp8, load them.
         # Otherwise, wait until process_weights_after_loading.
@@ -492,6 +642,18 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.block_quant:
             self.process_weights_after_loading_block_quant(layer)
         else:
+            if getattr(layer.weight, "load_time_fp8_quant", False):
+                self.use_per_token_if_dynamic = True
+                weight = layer.weight.data
+                if _use_aiter and self.use_aiter_fp8_per_token:
+                    weight = shuffle_weight(weight.contiguous(), (16, 16))
+                layer.weight = Parameter(weight.t(), requires_grad=False)
+                layer.weight_scale = Parameter(
+                    layer.weight_scale.data, requires_grad=False
+                )
+                layer.input_scale = None
+                return
+
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
             # If checkpoint not serialized fp8, quantize the weights.
@@ -695,6 +857,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
+        self.use_load_time_quantization = (
+            _use_aiter
+            and envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
+            and not self.quant_config.is_checkpoint_fp8_serialized
+            and not self.block_quant
+        )
         self.with_bias = False
         if get_moe_runner_backend().is_cutlass():
             assert (
@@ -733,6 +901,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
+        elif self.use_load_time_quantization:
+            params_dtype = fp8_dtype
         tp_size = get_tensor_model_parallel_world_size()
         if self.block_quant:
             block_n, block_k = (
@@ -1149,6 +1319,53 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer.w13_input_scale = None
         layer.w2_input_scale = None
 
+    def load_weight_shard(
+        self,
+        layer: Module,
+        expert_data: torch.Tensor,
+        loaded_weight: torch.Tensor,
+        shard_id: str,
+        expert_id: int,
+        shard_start: int,
+    ) -> None:
+        if loaded_weight.device != expert_data.device:
+            loaded_weight = loaded_weight.to(expert_data.device, non_blocking=True)
+        qweight, weight_scale = per_token_group_quant_fp8(
+            loaded_weight.contiguous(), loaded_weight.shape[-1]
+        )
+        expert_data.copy_(qweight)
+        weight_scale = weight_scale.squeeze(-1).contiguous()
+        if shard_id in ("w1", "w3", "w13"):
+            layer.w13_weight_scale1.data[expert_id].narrow(
+                0, shard_start, weight_scale.numel()
+            ).copy_(weight_scale)
+        elif shard_id == "w2":
+            layer.w2_weight_scale1.data[expert_id].copy_(weight_scale)
+        else:
+            raise ValueError(
+                f"Unsupported MoE shard_id for FP8 load-time quant: {shard_id}"
+            )
+
+    def process_load_time_quantized_weights(self, layer: Module) -> None:
+        layer.w13_weight = torch.nn.Parameter(
+            shuffle_weight(layer.w13_weight.data.contiguous(), (16, 16)),
+            requires_grad=False,
+        )
+        torch.cuda.empty_cache()
+        layer.w2_weight = torch.nn.Parameter(
+            shuffle_weight(layer.w2_weight.data.contiguous(), (16, 16)),
+            requires_grad=False,
+        )
+        torch.cuda.empty_cache()
+        layer.w13_weight_scale1 = torch.nn.Parameter(
+            layer.w13_weight_scale1.data, requires_grad=False
+        )
+        layer.w2_weight_scale1 = torch.nn.Parameter(
+            layer.w2_weight_scale1.data, requires_grad=False
+        )
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
@@ -1161,6 +1378,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # If checkpoint is fp16 or bfloat16, quantize in place.
         if not self.quant_config.is_checkpoint_fp8_serialized:
+            if self.use_load_time_quantization:
+                self.process_load_time_quantized_weights(layer)
+                return
+
             # If ROCm, fp8_dtype will be float8_e4m3fnuz (MI300x HW)
             w13_weight = torch.empty_like(layer.w13_weight.data, dtype=fp8_dtype)
             w2_weight = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype)

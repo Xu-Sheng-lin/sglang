@@ -112,6 +112,14 @@ QWEN3_5_PACKED_MODULES_MAPPING = {
 }
 
 
+def _skip_linear_attn_ba_fp8_quant(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    # Qwen3.5 FP8 checkpoints and RTP both keep linear_attn ba weights in BF16.
+    # Quantizing them online also hits unsupported AITER PTPC small-N GEMM shapes.
+    return quant_config is not None and quant_config.get_name() == "fp8"
+
+
 class Qwen3_5SparseMoeBlock(Qwen2MoeSparseMoeBlock):
     """Qwen3.5-specific MoE block with fused shared expert gating on HIP."""
 
@@ -216,11 +224,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 tp_size=self.attn_tp_size,
                 prefix=add_prefix("in_proj_z", prefix),
             )
+            ba_quant_config = (
+                None if _skip_linear_attn_ba_fp8_quant(quant_config) else quant_config
+            )
             self.in_proj_b = ColumnParallelLinear(
                 input_size=self.hidden_size,
                 output_size=self.num_v_heads,
                 bias=False,
-                quant_config=quant_config,
+                quant_config=ba_quant_config,
                 tp_rank=self.attn_tp_rank,
                 tp_size=self.attn_tp_size,
                 prefix=add_prefix("in_proj_b", prefix),
@@ -229,7 +240,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 input_size=self.hidden_size,
                 output_size=self.num_v_heads,
                 bias=False,
-                quant_config=quant_config,
+                quant_config=ba_quant_config,
                 tp_rank=self.attn_tp_rank,
                 tp_size=self.attn_tp_size,
                 prefix=add_prefix("in_proj_a", prefix),

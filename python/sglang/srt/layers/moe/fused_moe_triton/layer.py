@@ -351,6 +351,7 @@ class FusedMoE(torch.nn.Module):
         loaded_weight: torch.Tensor,
         tp_rank: int,
         is_bias: bool = False,
+        expert_id: Optional[int] = None,
     ):
         # Load grouped weight scales for group quantization
         # or model weights
@@ -362,6 +363,7 @@ class FusedMoE(torch.nn.Module):
                 expert_data=expert_data,
                 tp_rank=tp_rank,
                 is_bias=is_bias,
+                expert_id=expert_id,
             )
         elif shard_id in ("w1", "w3", "w13"):
             self._load_w13(
@@ -371,6 +373,7 @@ class FusedMoE(torch.nn.Module):
                 expert_data=expert_data,
                 tp_rank=tp_rank,
                 is_bias=is_bias,
+                expert_id=expert_id,
             )
 
     def _load_per_channel_weight_scale(
@@ -391,7 +394,38 @@ class FusedMoE(torch.nn.Module):
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 tp_rank=tp_rank,
+                expert_id=None,
             )
+
+    def _maybe_load_time_fp8_moe_weight(
+        self,
+        expert_data: torch.Tensor,
+        loaded_weight: torch.Tensor,
+        shard_id: str,
+        expert_id: Optional[int],
+        shard_start: int,
+        is_bias: bool = False,
+    ) -> bool:
+        if is_bias or expert_id is None:
+            return False
+
+        method = self.quant_method
+        if isinstance(method, KTEPWrapperMethod):
+            method = method.gpu_method
+        if not isinstance(method, Fp8MoEMethod) or not getattr(
+            method, "use_load_time_quantization", False
+        ):
+            return False
+
+        method.load_weight_shard(
+            self,
+            expert_data,
+            loaded_weight,
+            shard_id,
+            expert_id,
+            shard_start,
+        )
+        return True
 
     def _load_w13(
         self,
@@ -401,6 +435,7 @@ class FusedMoE(torch.nn.Module):
         loaded_weight: torch.Tensor,
         tp_rank: int,
         is_bias: bool = False,
+        expert_id: Optional[int] = None,
     ):
         # Index the loaded weight for tp sharding.
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
@@ -456,6 +491,15 @@ class FusedMoE(torch.nn.Module):
                 )
 
             expert_data = expert_data.narrow(shard_dim, start, shard_size)
+        if self._maybe_load_time_fp8_moe_weight(
+            expert_data,
+            loaded_weight,
+            shard_id,
+            expert_id,
+            start,
+            is_bias=is_bias,
+        ):
+            return
         expert_data.copy_(loaded_weight)
 
     def _load_w2(
@@ -466,6 +510,7 @@ class FusedMoE(torch.nn.Module):
         loaded_weight: torch.Tensor,
         tp_rank: int,
         is_bias: bool = False,
+        expert_id: Optional[int] = None,
     ):
         """Load w2 weights for down projection.
 
@@ -529,6 +574,15 @@ class FusedMoE(torch.nn.Module):
                 )
 
         # w2, down_proj: Load into only logical weight of w2.
+        if self._maybe_load_time_fp8_moe_weight(
+            expert_data,
+            loaded_weight,
+            shard_id,
+            expert_id,
+            0,
+            is_bias=is_bias,
+        ):
+            return
         expert_data.copy_(loaded_weight)
 
     def _load_single_value(
@@ -794,6 +848,7 @@ class FusedMoE(torch.nn.Module):
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
                     tp_rank=tp_rank,
+                    expert_id=expert_id,
                 )
             return
 
@@ -861,6 +916,7 @@ class FusedMoE(torch.nn.Module):
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 tp_rank=tp_rank,
+                expert_id=expert_id,
             )
             return
 
