@@ -23,6 +23,7 @@ from typing import Callable, Iterable, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 from transformers.activations import ACT2FN
 
@@ -148,15 +149,17 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         target_dtype = self.proj.weight.dtype
-        hidden_states = hidden_states.view(
+        hidden_states = hidden_states.to(dtype=target_dtype).reshape(
             -1,
-            self.in_channels,
-            self.temporal_patch_size,
-            self.patch_size,
-            self.patch_size,
+            self.in_channels
+            * self.temporal_patch_size
+            * self.patch_size
+            * self.patch_size,
         )
-        hidden_states = self.proj(hidden_states.to(dtype=target_dtype)).view(
-            -1, self.embed_dim
+        hidden_states = F.linear(
+            hidden_states,
+            self.proj.weight.reshape(self.embed_dim, -1),
+            self.proj.bias,
         )
         return hidden_states
 
