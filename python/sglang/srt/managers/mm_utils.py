@@ -1004,6 +1004,10 @@ def embed_mm_inputs(
                     multimodal_model.separate_deepstack_embeds(embedding)
                 )
                 deepstack_embeddings += [deepstack_embedding]
+            else:
+                # Keep this aligned with modalities/embeddings/masks when a
+                # modality is cached or does not use deepstack.
+                deepstack_embeddings += [None]
             modalities += [modality]
             embeddings += [embedding]
             masks += [mask]
@@ -1054,7 +1058,7 @@ def embed_mm_inputs(
         # Need to expand mask to match embedding dimensions
         input_embeds.masked_scatter_(mask_1d.unsqueeze(-1), embedding)
 
-        if use_deepstack.get(modality, None):
+        if use_deepstack.get(modality, None) and deepstack_embeddings[i] is not None:
             deepstack_emb = deepstack_embeddings[i]
             if (
                 deepstack_emb.device != input_embeds.device

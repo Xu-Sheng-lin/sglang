@@ -344,11 +344,18 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_5",
             "qwen3_5_moe",
         ):
+            videos_kwargs = {}
+            if video_metadata is not None:
+                videos_kwargs.update(
+                    {
+                        "video_metadata": video_metadata,
+                        "do_sample_frames": False,
+                    }
+                )
             mm_items, input_ids, ret = self.process_and_combine_mm_data(
                 base_output,
                 self.mm_tokens,
-                video_metadata=video_metadata,
-                do_sample_frames=False,
+                videos_kwargs=videos_kwargs,
             )
         else:
             mm_items, input_ids, ret = self.process_and_combine_mm_data(
