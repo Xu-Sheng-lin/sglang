@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
@@ -101,6 +102,7 @@ _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 if _use_aiter or _use_hip_int4:
     from aiter import ActivationType, QuantType
+    import aiter.fused_moe as aiter_fused_moe
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
 
@@ -108,6 +110,85 @@ if _use_aiter or _use_hip_int4:
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
+
+
+def _patch_aiter_fp8_block_moe_small_m_splitk() -> None:
+    if (
+        not _use_aiter
+        or getattr(aiter_fused_moe, "_sglang_small_m_splitk_patch", False)
+        or aiter_fused_moe.get_gfx() != "gfx942"
+    ):
+        return
+
+    original_get_2stage_cfgs = aiter_fused_moe.get_2stage_cfgs
+
+    @functools.wraps(original_get_2stage_cfgs)
+    def get_2stage_cfgs_small_m_safe(
+        token,
+        model_dim,
+        inter_dim,
+        expert,
+        topk,
+        dtype,
+        q_dtype_a,
+        q_dtype_w,
+        q_type,
+        use_g1u1,
+        activation,
+        doweight_stage1,
+        hidden_pad,
+        intermediate_pad,
+        is_shuffled=True,
+    ):
+        metadata = original_get_2stage_cfgs(
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            q_type,
+            use_g1u1,
+            activation,
+            doweight_stage1,
+            hidden_pad,
+            intermediate_pad,
+            is_shuffled,
+        )
+        if (
+            q_type != QuantType.per_1x128
+            or token * topk > expert
+            or metadata.run_1stage
+            or metadata.ksplit <= 1
+            or getattr(metadata.stage1, "func", None)
+            is not aiter_fused_moe.ck_moe_stage1
+        ):
+            return metadata
+
+        stage1_keywords = dict(metadata.stage1.keywords or {})
+        stage1_keywords["splitk"] = 0
+        return aiter_fused_moe.MOEMetadata(
+            stage1=functools.partial(
+                metadata.stage1.func,
+                *metadata.stage1.args,
+                **stage1_keywords,
+            ),
+            stage2=metadata.stage2,
+            block_m=metadata.block_m,
+            ksplit=0,
+            run_1stage=metadata.run_1stage,
+            has_bias=metadata.has_bias,
+            use_non_temporal_load=metadata.use_non_temporal_load,
+        )
+
+    aiter_fused_moe.get_2stage_cfgs = get_2stage_cfgs_small_m_safe
+    aiter_fused_moe._sglang_small_m_splitk_patch = True
+
+
+if _use_aiter:
+    _patch_aiter_fp8_block_moe_small_m_splitk()
 
 
 class LoadTimeFp8LinearWeightParameter(ModelWeightParameter):
