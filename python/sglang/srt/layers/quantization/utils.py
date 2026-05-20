@@ -43,6 +43,17 @@ def get_scalar_types():
 ScalarType, scalar_types = get_scalar_types()
 
 
+def _ignored_name_match(ignored: str, name: str) -> bool:
+    # Path-segment-aware match. Avoids the substring false-positive
+    # where e.g. "mlp.gate" would otherwise match "mlp.gate_proj".
+    return (
+        name == ignored
+        or name.startswith(ignored + ".")
+        or name.endswith("." + ignored)
+        or ("." + ignored + ".") in name
+    )
+
+
 def is_layer_skipped(
     prefix: str,
     ignored_layers: List[str],
@@ -65,7 +76,8 @@ def is_layer_skipped(
         is_skipped = None
         for shard_prefix in shard_prefixes:
             is_shard_skipped = any(
-                ignored in shard_prefix for ignored in ignored_layers
+                _ignored_name_match(ignored, shard_prefix)
+                for ignored in ignored_layers
             )
 
             if is_skipped is None:
@@ -77,7 +89,9 @@ def is_layer_skipped(
                     "to have the same precision."
                 )
     else:
-        is_skipped = any(ignored in prefix for ignored in ignored_layers)
+        is_skipped = any(
+            _ignored_name_match(ignored, prefix) for ignored in ignored_layers
+        )
         if "gate_up_proj" in prefix:
             prefix_gate = prefix.replace("gate_up_proj", "gate_proj")
             prefix_up = prefix.replace("gate_up_proj", "up_proj")
