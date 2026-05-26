@@ -1345,9 +1345,12 @@ class HybridLinearKVPool(KVCache):
         self.use_mla = use_mla
         if not use_mla:
 
+            from sglang.srt.server_args import get_global_server_args
+
+            _attn_backend = get_global_server_args().attention_backend
             TokenToKVPoolClass = (
                 MHARocmBlockKVPool
-                if _is_hip and page_size > 1
+                if _is_hip and page_size > 1 and _attn_backend == "aiter"
                 else MHATokenToKVPool
             )
 

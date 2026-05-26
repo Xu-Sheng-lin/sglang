@@ -1124,22 +1124,59 @@ class AiterAttnBackend(AttentionBackend):
                     # num_kv_splits_indptr=num_kv_splits_indptr,
                 )
             else:
-                seq_lens_sum = seq_lens.sum().item()
-                self.indices_updater_prefill.update(
-                    req_pool_indices,
-                    seq_lens,
-                    seq_lens_sum,
-                    prefix_lens=None,
-                    encoder_lens=encoder_lens,
-                    spec_info=spec_info,
+                # Non-MLA target_verify: use pre-allocated cuda graph buffers
+                # (indices_updater_prefill allocates dynamic tensors incompatible
+                # with CUDA graph replay which writes to self.cuda_graph_kv_indices)
+                qo_indptr = self.qo_indptr[: bs + 1]
+                qo_indptr[: bs + 1] = torch.arange(
+                    0,
+                    (1 + bs) * self.num_draft_tokens,
+                    step=self.num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
                 )
+                kv_lens = seq_lens + self.num_draft_tokens
+                kv_indptr = self.kv_indptr[: bs + 1]
+                kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
+                kv_indices = self.cuda_graph_kv_indices
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    kv_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
+                )
+                max_q_len = self.num_draft_tokens
+
+                block_tables = None
+                context_lens = None
+                if not self.use_mla and self.use_rocm_block_kv:
+                    context_lens = self.context_lens_buf[:bs]
+                    context_lens.copy_(kv_lens[:bs].to(torch.int32))
+                    max_num_blocks = (
+                        self.max_context_len + self.page_size - 1
+                    ) // self.page_size
+                    block_tables = self.block_tables_buf[:bs, :max_num_blocks]
+                    _build_block_tables(
+                        self.req_to_token,
+                        req_pool_indices,
+                        block_tables,
+                        self.page_size,
+                        max_num_blocks,
+                    )
+
                 self.forward_metadata = ForwardMetadata(
-                    self.indices_updater_prefill.kv_indptr,
-                    self.indices_updater_prefill.kv_indices,
+                    kv_indptr,
+                    kv_indices,
+                    qo_indptr,
                     None,
-                    None,
-                    self.indices_updater_prefill.max_q_len,
-                    self.indices_updater_prefill.max_kv_len,
+                    max_q_len,
+                    self.max_context_len,
+                    block_tables=block_tables,
+                    context_lens=context_lens,
+                    max_context_len_val=self.max_context_len if block_tables is not None else None,
                 )
         elif forward_mode.is_draft_extend():
             num_tokens_per_bs = self.speculative_num_steps + 1
@@ -1166,7 +1203,10 @@ class AiterAttnBackend(AttentionBackend):
             kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
             max_q_len = num_tokens_per_bs
 
-            if _use_mla_ps_kernel:
+            block_tables = None
+            context_lens = None
+
+            if self.use_mla and _use_mla_ps_kernel:
 
                 num_kv_splits = self.max_split_per_batch
 
@@ -1193,6 +1233,20 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_indptr = self.reduce_indptr
                 reduce_final_map = self.reduce_final_map
                 reduce_partial_map = self.reduce_partial_map
+            elif not self.use_mla and self.use_rocm_block_kv:
+                context_lens = self.context_lens_buf[:bs]
+                context_lens.copy_(seq_lens[:bs].to(torch.int32))
+                max_num_blocks = (
+                    self.max_context_len + self.page_size - 1
+                ) // self.page_size
+                block_tables = self.block_tables_buf[:bs, :max_num_blocks]
+                _build_block_tables(
+                    self.req_to_token,
+                    req_pool_indices,
+                    block_tables,
+                    self.page_size,
+                    max_num_blocks,
+                )
 
             self.forward_metadata = ForwardMetadata(
                 kv_indptr,
@@ -1200,7 +1254,7 @@ class AiterAttnBackend(AttentionBackend):
                 qo_indptr,
                 kv_last_page_len,
                 max_q_len,
-                kv_indptr[-1].item(),
+                self.max_context_len,
                 work_metadata=work_metadata,
                 work_info_set=work_info_set,
                 work_indptr=work_indptr,
@@ -1209,6 +1263,9 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_partial_map=reduce_partial_map,
                 num_kv_splits=num_kv_splits,
                 # num_kv_splits_indptr=num_kv_splits_indptr,
+                block_tables=block_tables,
+                context_lens=context_lens,
+                max_context_len_val=self.max_context_len if block_tables is not None else None,
             )
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
@@ -1286,6 +1343,23 @@ class AiterAttnBackend(AttentionBackend):
                 kv_indices,
                 self.req_to_token.stride(0),
             )
+            if self.use_rocm_block_kv and not self.use_mla:
+                context_lens = self.context_lens_buf[:bs]
+                context_lens.copy_(kv_lens[:bs].to(torch.int32))
+                self.forward_metadata.context_lens = context_lens
+                max_num_blocks = (
+                    self.max_context_len + self.page_size - 1
+                ) // self.page_size
+                block_tables = self.block_tables_buf[:bs, :max_num_blocks]
+                _build_block_tables(
+                    self.req_to_token,
+                    req_pool_indices,
+                    block_tables,
+                    self.page_size,
+                    max_num_blocks,
+                )
+                self.forward_metadata.block_tables = block_tables
+                self.forward_metadata.max_context_len_val = self.max_context_len
 
         elif forward_mode.is_draft_extend():
             seq_lens = seq_lens[:bs]
@@ -1304,6 +1378,23 @@ class AiterAttnBackend(AttentionBackend):
                 kv_indices,
                 self.req_to_token.stride(0),
             )
+            if self.use_rocm_block_kv and not self.use_mla:
+                context_lens = self.context_lens_buf[:bs]
+                context_lens.copy_(seq_lens[:bs].to(torch.int32))
+                self.forward_metadata.context_lens = context_lens
+                max_num_blocks = (
+                    self.max_context_len + self.page_size - 1
+                ) // self.page_size
+                block_tables = self.block_tables_buf[:bs, :max_num_blocks]
+                _build_block_tables(
+                    self.req_to_token,
+                    req_pool_indices[:bs],
+                    block_tables,
+                    self.page_size,
+                    max_num_blocks,
+                )
+                self.forward_metadata.block_tables = block_tables
+                self.forward_metadata.max_context_len_val = self.max_context_len
 
         else:
             raise ValueError("Invalid forward mode")
