@@ -2055,7 +2055,16 @@ class ServerArgs:
     def _handle_page_size(self):
         if self.page_size is None:
             if is_hip():
-                self.page_size = 16
+                # For speculative decoding (EAGLE/NEXTN) with aiter backend,
+                # page_size=1 (flat KV layout) enables extend_attention_fwd which
+                # is significantly faster than paged_attention_rocm for multi-token verify.
+                if (
+                    self.speculative_algorithm is not None
+                    and self.attention_backend == "aiter"
+                ):
+                    self.page_size = 1
+                else:
+                    self.page_size = 16
             else:
                 self.page_size = 1
 

@@ -226,6 +226,7 @@ class AiterAttnBackend(AttentionBackend):
             max_num_blocks_per_seq = (
                 self.max_context_len + self.page_size - 1
             ) // self.page_size
+            self.max_num_blocks_per_seq = max_num_blocks_per_seq
             # Pre-allocate block_tables for CUDA graph compatibility
             self.block_tables_buf = torch.zeros(
                 (max_bs, max_num_blocks_per_seq),
@@ -235,39 +236,42 @@ class AiterAttnBackend(AttentionBackend):
             self.context_lens_buf = torch.zeros(
                 (max_bs,), dtype=torch.int32, device=self.device
             )
-            # Workspace for paged attention decode
+            # Workspace for paged attention (decode and MTP extend/verify)
+            # For MTP (speculative decoding), output/workspace is per-query-token:
+            # [num_seqs * mtp, ...] where mtp = num_draft_tokens
+            pa_buf_size = max_bs * max(1, self.num_draft_tokens or 1)
             if self.use_gluon_pa:
                 # Gluon PA: GQA-aware layout [bs, kv_heads, parts, grp_sz, ...]
                 query_grp_sz = self.num_head // self.num_kv_head
                 self.pa_rocm_tmp_output = torch.empty(
-                    (max_bs, self.num_kv_head, self.max_num_partitions, query_grp_sz, self.head_dim),
+                    (pa_buf_size, self.num_kv_head, self.max_num_partitions, query_grp_sz, self.head_dim),
                     dtype=model_runner.model_config.dtype,
                     device=self.device,
                 )
                 self.pa_rocm_exp_sums = torch.empty(
-                    (max_bs, self.num_kv_head, self.max_num_partitions, query_grp_sz),
+                    (pa_buf_size, self.num_kv_head, self.max_num_partitions, query_grp_sz),
                     dtype=torch.float32,
                     device=self.device,
                 )
                 self.pa_rocm_max_logits = torch.ones(
-                    (max_bs, self.num_kv_head, self.max_num_partitions, query_grp_sz),
+                    (pa_buf_size, self.num_kv_head, self.max_num_partitions, query_grp_sz),
                     dtype=torch.float32,
                     device=self.device,
                 )
             else:
-                # HIP aiter: flat heads layout [bs, num_heads, parts, ...]
+                # HIP aiter: flat heads layout [bs*mtp, num_heads, parts, ...]
                 self.pa_rocm_tmp_output = torch.empty(
-                    (max_bs, self.num_head, self.max_num_partitions, self.head_dim),
+                    (pa_buf_size, self.num_head, self.max_num_partitions, self.head_dim),
                     dtype=model_runner.model_config.dtype,
                     device=self.device,
                 )
                 self.pa_rocm_exp_sums = torch.empty(
-                    (max_bs, self.num_head, self.max_num_partitions),
+                    (pa_buf_size, self.num_head, self.max_num_partitions),
                     dtype=torch.float32,
                     device=self.device,
                 )
                 self.pa_rocm_max_logits = torch.ones(
-                    (max_bs, self.num_head, self.max_num_partitions),
+                    (pa_buf_size, self.num_head, self.max_num_partitions),
                     dtype=torch.float32,
                     device=self.device,
                 )
@@ -703,6 +707,7 @@ class AiterAttnBackend(AttentionBackend):
                     None,
                     self.indices_updater_prefill.max_q_len,
                     self.indices_updater_prefill.max_kv_len,
+                    run_graph=False,
                 )
         elif forward_batch.forward_mode.is_target_verify():
             if self.use_mla:
@@ -799,6 +804,7 @@ class AiterAttnBackend(AttentionBackend):
                     None,
                     self.indices_updater_prefill.max_q_len,
                     self.indices_updater_prefill.max_kv_len,
+                    run_graph=False,
                 )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
@@ -885,6 +891,7 @@ class AiterAttnBackend(AttentionBackend):
                     None,
                     self.indices_updater_prefill.max_q_len,
                     self.indices_updater_prefill.max_kv_len,
+                    run_graph=False,
                 )
 
     def init_cuda_graph_state(
@@ -1125,8 +1132,6 @@ class AiterAttnBackend(AttentionBackend):
                 )
             else:
                 # Non-MLA target_verify: use pre-allocated cuda graph buffers
-                # (indices_updater_prefill allocates dynamic tensors incompatible
-                # with CUDA graph replay which writes to self.cuda_graph_kv_indices)
                 qo_indptr = self.qo_indptr[: bs + 1]
                 qo_indptr[: bs + 1] = torch.arange(
                     0,
@@ -1135,29 +1140,30 @@ class AiterAttnBackend(AttentionBackend):
                     dtype=torch.int32,
                     device=self.device,
                 )
-                kv_lens = seq_lens + self.num_draft_tokens
-                kv_indptr = self.kv_indptr[: bs + 1]
-                kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
-                kv_indices = self.cuda_graph_kv_indices
-                create_flashinfer_kv_indices_triton[(bs,)](
-                    self.req_to_token,
-                    req_pool_indices,
-                    kv_lens,
-                    kv_indptr,
-                    None,
-                    kv_indices,
-                    self.req_to_token.stride(0),
-                )
                 max_q_len = self.num_draft_tokens
 
                 block_tables = None
                 context_lens = None
-                if not self.use_mla and self.use_rocm_block_kv:
+                if self.use_rocm_block_kv:
+                    # Block KV: use paged_attention_rocm with native MTP causal masking
+                    # context_lens = seq_lens + MTP so formula visible[i] = context_len - MTP + i + 1
+                    mtp = self.num_draft_tokens
+                    kv_lens = seq_lens + mtp
+                    kv_indptr = self.kv_indptr[: bs + 1]
+                    kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
+                    kv_indices = self.cuda_graph_kv_indices
+                    create_flashinfer_kv_indices_triton[(bs,)](
+                        self.req_to_token,
+                        req_pool_indices,
+                        kv_lens,
+                        kv_indptr,
+                        None,
+                        kv_indices,
+                        self.req_to_token.stride(0),
+                    )
                     context_lens = self.context_lens_buf[:bs]
                     context_lens.copy_(kv_lens[:bs].to(torch.int32))
-                    max_num_blocks = (
-                        self.max_context_len + self.page_size - 1
-                    ) // self.page_size
+                    max_num_blocks = self.max_num_blocks_per_seq
                     block_tables = self.block_tables_buf[:bs, :max_num_blocks]
                     _build_block_tables(
                         self.req_to_token,
@@ -1165,6 +1171,21 @@ class AiterAttnBackend(AttentionBackend):
                         block_tables,
                         self.page_size,
                         max_num_blocks,
+                    )
+                else:
+                    # Flat KV: kv_indptr covers prefix only (extend_attention_fwd
+                    # handles extend tokens separately with causal masking)
+                    kv_indptr = self.kv_indptr[: bs + 1]
+                    kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+                    kv_indices = self.cuda_graph_kv_indices
+                    create_flashinfer_kv_indices_triton[(bs,)](
+                        self.req_to_token,
+                        req_pool_indices,
+                        seq_lens,
+                        kv_indptr,
+                        None,
+                        kv_indices,
+                        self.req_to_token.stride(0),
                     )
 
                 self.forward_metadata = ForwardMetadata(
@@ -1234,11 +1255,11 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_final_map = self.reduce_final_map
                 reduce_partial_map = self.reduce_partial_map
             elif not self.use_mla and self.use_rocm_block_kv:
+                # Include draft tokens in context_lens for paged_attention_rocm MTP causal mask
+                kv_lens_draft = seq_lens + num_tokens_per_bs
                 context_lens = self.context_lens_buf[:bs]
-                context_lens.copy_(seq_lens[:bs].to(torch.int32))
-                max_num_blocks = (
-                    self.max_context_len + self.page_size - 1
-                ) // self.page_size
+                context_lens.copy_(kv_lens_draft[:bs].to(torch.int32))
+                max_num_blocks = self.max_num_blocks_per_seq
                 block_tables = self.block_tables_buf[:bs, :max_num_blocks]
                 _build_block_tables(
                     self.req_to_token,
@@ -1330,26 +1351,26 @@ class AiterAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
-            kv_lens = seq_lens + self.num_draft_tokens
             kv_indptr = self.kv_indptr[: bs + 1]
-            kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
             kv_indices = self.cuda_graph_kv_indices
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                kv_lens,
-                kv_indptr,
-                None,
-                kv_indices,
-                self.req_to_token.stride(0),
-            )
             if self.use_rocm_block_kv and not self.use_mla:
+                # Block KV: rebuild block_tables and context_lens for MTP causal
+                mtp = self.num_draft_tokens
+                kv_lens = seq_lens + mtp
+                kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    kv_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
+                )
                 context_lens = self.context_lens_buf[:bs]
                 context_lens.copy_(kv_lens[:bs].to(torch.int32))
                 self.forward_metadata.context_lens = context_lens
-                max_num_blocks = (
-                    self.max_context_len + self.page_size - 1
-                ) // self.page_size
+                max_num_blocks = self.max_num_blocks_per_seq
                 block_tables = self.block_tables_buf[:bs, :max_num_blocks]
                 _build_block_tables(
                     self.req_to_token,
@@ -1360,6 +1381,18 @@ class AiterAttnBackend(AttentionBackend):
                 )
                 self.forward_metadata.block_tables = block_tables
                 self.forward_metadata.max_context_len_val = self.max_context_len
+            else:
+                # Flat KV: indices cover prefix only for extend_attention_fwd
+                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    seq_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
+                )
 
         elif forward_mode.is_draft_extend():
             seq_lens = seq_lens[:bs]
@@ -1379,12 +1412,13 @@ class AiterAttnBackend(AttentionBackend):
                 self.req_to_token.stride(0),
             )
             if self.use_rocm_block_kv and not self.use_mla:
+                # Include draft tokens in context_lens for paged_attention_rocm MTP causal mask
+                num_tokens_per_bs = self.speculative_num_steps + 1
+                kv_lens_draft = seq_lens + num_tokens_per_bs
                 context_lens = self.context_lens_buf[:bs]
-                context_lens.copy_(seq_lens[:bs].to(torch.int32))
+                context_lens.copy_(kv_lens_draft[:bs].to(torch.int32))
                 self.forward_metadata.context_lens = context_lens
-                max_num_blocks = (
-                    self.max_context_len + self.page_size - 1
-                ) // self.page_size
+                max_num_blocks = self.max_num_blocks_per_seq
                 block_tables = self.block_tables_buf[:bs, :max_num_blocks]
                 _build_block_tables(
                     self.req_to_token,
@@ -1770,50 +1804,96 @@ class AiterAttnBackend(AttentionBackend):
                     f"Invalid forward mode for MLA prefill: {forward_batch.forward_mode=}"
                 )
         elif self.use_rocm_block_kv:
-            # Block KV cache: gather from 5D layout to [N, kv_heads, head_dim]
-            # Use flash_attn_varlen_func instead of mha_batch_prefill_func
-            # to work around non-deterministic output bug in mha_batch_prefill_func
             k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
             # k_cache: [num_blocks, kv_heads, head_dim//vs, page_size, vs]
             # v_cache: [num_blocks, kv_heads, head_dim, page_size]
 
-            from sglang.srt.layers.attention.triton_ops.rocm_kv_cache import (
-                gather_kv_cache,
-            )
+            if self.forward_metadata.run_graph:
+                # CUDA graph mode: MTP=1 expanded batch — each query token is
+                # its own "sequence" with per-query context_lens for causal masking.
+                # This avoids MTP inner loop overhead and leverages L2 cache sharing.
+                bs = forward_batch.batch_size
+                mtp = self.num_draft_tokens
+                num_tokens = bs * mtp
 
-            bs = forward_batch.batch_size
-            bs0 = bs + 1
-            kv_indices = self.forward_metadata.kv_indices
-            total_kv = kv_indices.shape[0]
-            kv_heads = k_cache.shape[1]
+                query = q.contiguous().view(num_tokens, layer.tp_q_head_num, layer.qk_head_dim)
+                output = torch.empty(
+                    (num_tokens, layer.tp_q_head_num, layer.v_head_dim),
+                    dtype=self.input_dtype,
+                    device=self.device,
+                )
 
-            k_gathered = torch.empty(
-                (total_kv, kv_heads, layer.head_dim),
-                dtype=k_cache.dtype,
-                device=self.device,
-            )
-            v_gathered = torch.empty(
-                (total_kv, kv_heads, layer.head_dim),
-                dtype=v_cache.dtype,
-                device=self.device,
-            )
-            gather_kv_cache(k_gathered, v_gathered, k_cache, v_cache, kv_indices)
+                block_tables = self.forward_metadata.block_tables
+                context_lens = self.forward_metadata.context_lens
+                max_context_len = self.forward_metadata.max_context_len_val
 
-            o = flash_attn_varlen_func(
-                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                k_gathered,
-                v_gathered,
-                self.qo_indptr[:bs0],
-                self.forward_metadata.kv_indptr[:bs0],
-                self.forward_metadata.max_q_len,
-                self.forward_metadata.max_kv_len,
-                softmax_scale=layer.scaling,
-                causal=True,
-            )
+                tmp_output = self.pa_rocm_tmp_output[:num_tokens]
+                exp_sums = self.pa_rocm_exp_sums[:num_tokens]
+                max_logits = self.pa_rocm_max_logits[:num_tokens]
 
-            return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+                paged_attention_rocm(
+                    output,
+                    exp_sums,
+                    max_logits,
+                    tmp_output,
+                    query,
+                    k_cache,
+                    v_cache,
+                    layer.tp_k_head_num,
+                    float(layer.scaling),
+                    block_tables,
+                    context_lens,
+                    self.page_size,
+                    max_context_len,
+                    None,               # alibi_slopes
+                    "auto",             # kv_cache_dtype
+                    self.k_scale,
+                    self.v_scale,
+                    None,               # fp8_out_scale
+                    _AITER_PARTITION_SIZE_ROCM,
+                    mtp,                # MTP: causal multi-token attention
+                )
+
+                return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            else:
+                # Non-graph mode: gather from 5D layout and use flash_attn_varlen_func
+                from sglang.srt.layers.attention.triton_ops.rocm_kv_cache import (
+                    gather_kv_cache,
+                )
+
+                bs = forward_batch.batch_size
+                bs0 = bs + 1
+                kv_indices = self.forward_metadata.kv_indices
+                total_kv = kv_indices.shape[0]
+                kv_heads = k_cache.shape[1]
+
+                k_gathered = torch.empty(
+                    (total_kv, kv_heads, layer.head_dim),
+                    dtype=k_cache.dtype,
+                    device=self.device,
+                )
+                v_gathered = torch.empty(
+                    (total_kv, kv_heads, layer.head_dim),
+                    dtype=v_cache.dtype,
+                    device=self.device,
+                )
+                gather_kv_cache(k_gathered, v_gathered, k_cache, v_cache, kv_indices)
+
+                o = flash_attn_varlen_func(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k_gathered,
+                    v_gathered,
+                    self.qo_indptr[:bs0],
+                    self.forward_metadata.kv_indptr[:bs0],
+                    self.forward_metadata.max_q_len,
+                    self.forward_metadata.max_kv_len,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                )
+
+                return o.view(-1, layer.tp_q_head_num * layer.head_dim)
         else:
             k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
@@ -1827,24 +1907,48 @@ class AiterAttnBackend(AttentionBackend):
                 k_cache = k_cache.to(dtype)
                 v_cache = v_cache.to(dtype)
 
-            # Use flash_attn_varlen_func instead of mha_batch_prefill_func
-            # to work around non-deterministic output bug in mha_batch_prefill_func
-            kv_indices = self.forward_metadata.kv_indices
-            k_gathered = k_cache[kv_indices]
-            v_gathered = v_cache[kv_indices]
-            o = flash_attn_varlen_func(
-                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                k_gathered,
-                v_gathered,
-                self.qo_indptr[:bs0],
-                self.forward_metadata.kv_indptr[:bs0],
-                self.forward_metadata.max_q_len,
-                self.forward_metadata.max_kv_len,
-                softmax_scale=layer.scaling,
-                causal=True,
-            )
-
-            return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+            if self.forward_metadata.run_graph:
+                # CUDA graph mode: use extend_attention_fwd to avoid massive gather
+                # kv_indptr/kv_indices point to prefix only; k/v are extend tokens
+                o = torch.empty(
+                    (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+                    dtype=self.input_dtype,
+                    device=self.device,
+                )
+                self.extend_attention_fwd(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k.contiguous(),
+                    v.contiguous(),
+                    o,
+                    k_cache,
+                    v_cache,
+                    self.forward_metadata.qo_indptr[:bs0],
+                    self.forward_metadata.kv_indptr[:bs0],
+                    self.forward_metadata.kv_indices,
+                    None,
+                    True,
+                    None,
+                    self.forward_metadata.max_q_len,
+                    layer.scaling,
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            else:
+                # Non-graph mode: gather and use flash_attn_varlen_func
+                kv_indices = self.forward_metadata.kv_indices
+                k_gathered = k_cache[kv_indices]
+                v_gathered = v_cache[kv_indices]
+                o = flash_attn_varlen_func(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k_gathered,
+                    v_gathered,
+                    self.qo_indptr[:bs0],
+                    self.forward_metadata.kv_indptr[:bs0],
+                    self.forward_metadata.max_q_len,
+                    self.forward_metadata.max_kv_len,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def forward_decode(
         self,
