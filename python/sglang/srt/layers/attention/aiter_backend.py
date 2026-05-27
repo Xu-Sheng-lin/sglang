@@ -41,6 +41,11 @@ try:
         paged_attention_rocm,
     )
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
+    try:
+        from aiter_meta.csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import pa_decode_gluon_aot as _aiter_pa_decode_gluon
+        _HAS_AITER_GLUON_PA = True
+    except (ImportError, RuntimeError):
+        _HAS_AITER_GLUON_PA = False
 except ImportError:
     print(
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
@@ -237,12 +242,34 @@ class AiterAttnBackend(AttentionBackend):
                 (max_bs,), dtype=torch.int32, device=self.device
             )
             # Workspace for paged attention (decode and MTP extend/verify)
-            # For MTP (speculative decoding), output/workspace is per-query-token:
-            # [num_seqs * mtp, ...] where mtp = num_draft_tokens
-            pa_buf_size = max_bs * max(1, self.num_draft_tokens or 1)
-            if self.use_gluon_pa:
-                # Gluon PA: GQA-aware layout [bs, kv_heads, parts, grp_sz, ...]
-                query_grp_sz = self.num_head // self.num_kv_head
+            self.gqa_ratio = self.num_head // self.num_kv_head
+            self.use_aiter_gluon_pa = _HAS_AITER_GLUON_PA and not self.use_gluon_pa
+            if self.use_aiter_gluon_pa:
+                # Aiter Gluon PA: [bs, kv_heads, partitions, equiv_grp_sz, ...]
+                # equiv_grp_sz = query_length * gqa_ratio; use max(decode=1, verify=MTP)
+                max_ql = max(1, self.num_draft_tokens or 1)
+                max_equiv_grp = max_ql * self.gqa_ratio
+                self.gluon_partition_size = 256
+                self.pa_rocm_tmp_output = torch.zeros(
+                    (max_bs, self.num_kv_head, self.max_num_partitions, max_equiv_grp, self.head_dim),
+                    dtype=model_runner.model_config.dtype,
+                    device=self.device,
+                )
+                self.pa_rocm_exp_sums = torch.zeros(
+                    (max_bs, self.num_kv_head, self.max_num_partitions, max_equiv_grp),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                self.pa_rocm_max_logits = torch.full(
+                    (max_bs, self.num_kv_head, self.max_num_partitions, max_equiv_grp),
+                    -float("inf"),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+            elif self.use_gluon_pa:
+                # SGLang Gluon PA: GQA-aware layout [bs, kv_heads, parts, grp_sz, ...]
+                pa_buf_size = max_bs * max(1, self.num_draft_tokens or 1)
+                query_grp_sz = self.gqa_ratio
                 self.pa_rocm_tmp_output = torch.empty(
                     (pa_buf_size, self.num_kv_head, self.max_num_partitions, query_grp_sz, self.head_dim),
                     dtype=model_runner.model_config.dtype,
@@ -259,7 +286,8 @@ class AiterAttnBackend(AttentionBackend):
                     device=self.device,
                 )
             else:
-                # HIP aiter: flat heads layout [bs*mtp, num_heads, parts, ...]
+                # HIP aiter PA: flat heads layout [bs*mtp, num_heads, parts, ...]
+                pa_buf_size = max_bs * max(1, self.num_draft_tokens or 1)
                 self.pa_rocm_tmp_output = torch.empty(
                     (pa_buf_size, self.num_head, self.max_num_partitions, self.head_dim),
                     dtype=model_runner.model_config.dtype,
@@ -282,6 +310,10 @@ class AiterAttnBackend(AttentionBackend):
         )
 
         self.logits_soft_cap = 0.0
+
+        # Pre-compile gluon PA kernels before CUDA graph capture
+        if self.use_aiter_gluon_pa:
+            self._warmup_gluon_pa()
 
         self.forward_metadata: ForwardMetadata = None
 
@@ -311,6 +343,42 @@ class AiterAttnBackend(AttentionBackend):
                 self.max_split_per_batch = 64
 
             self.fix_max_split_per_batch = self.max_split_per_batch
+
+    def _warmup_gluon_pa(self):
+        """Pre-compile gluon PA kernels so CUDA graph capture doesn't trigger JIT."""
+        partition_size = self.gluon_partition_size
+        max_ctx = 512
+        max_parts = (max_ctx + partition_size - 1) // partition_size
+        page_size = self.page_size
+        num_blocks = (max_ctx + page_size - 1) // page_size
+
+        k_cache = torch.zeros(num_blocks, self.num_kv_head, self.head_dim // 8, page_size, 8,
+                              dtype=self.input_dtype, device=self.device)
+        v_cache = torch.zeros(num_blocks, self.num_kv_head, self.head_dim, page_size,
+                              dtype=self.input_dtype, device=self.device)
+        ctx_lens = torch.tensor([max_ctx], dtype=torch.int32, device=self.device)
+        bt = torch.arange(num_blocks, dtype=torch.int32, device=self.device).unsqueeze(0)
+
+        # Only warmup ql=1 (decode). ql>1 (MTP verify) AOT kernel may not be
+        # pre-compiled and JIT compilation requires triton >= 3.6.
+        ql = 1
+        equiv_grp = ql * self.gqa_ratio
+        q = torch.zeros(ql, self.num_head, self.head_dim, dtype=self.input_dtype, device=self.device)
+        out = torch.zeros(ql, self.num_head, self.head_dim, dtype=self.input_dtype, device=self.device)
+        exp_s = torch.zeros(1, self.num_kv_head, max_parts, equiv_grp, dtype=torch.float32, device=self.device)
+        max_l = torch.full((1, self.num_kv_head, max_parts, equiv_grp), -float("inf"),
+                           dtype=torch.float32, device=self.device)
+        tmp = torch.zeros(1, self.num_kv_head, max_parts, equiv_grp, self.head_dim,
+                          dtype=self.input_dtype, device=self.device)
+        _aiter_pa_decode_gluon(
+            output=out, query=q, key_cache=k_cache, value_cache=v_cache,
+            context_lengths=ctx_lens, block_tables=bt,
+            softmax_scale=self.scale, query_length=ql,
+            max_context_partition_num=max_parts, context_partition_size=partition_size,
+            compute_type=self.input_dtype, query_scale=None, key_scale=None, value_scale=None,
+            exp_sums=exp_s, max_logits=max_l, temporary_output=tmp,
+        )
+        torch.cuda.synchronize()
 
     def make_mla_decode_meta_data_buffer(self, max_seqlen_qo, batch_size):
         nhead = self.num_head
@@ -1004,6 +1072,23 @@ class AiterAttnBackend(AttentionBackend):
                     )
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
+                # Build block_tables for paged_attention_rocm in draft decode
+                if self.use_rocm_block_kv and not self.use_mla:
+                    # Draft decode needs valid block_tables so paged_attention_rocm
+                    # reads from 5D block KV (not falling through to ragged flat path).
+                    # seq_lens here includes draft tokens written so far.
+                    decode_kv_lens = seq_lens[:bs] + 1  # +1 for the current decode token
+                    context_lens = self.context_lens_buf[:bs]
+                    context_lens.copy_(decode_kv_lens.to(torch.int32))
+                    max_num_blocks = self.max_num_blocks_per_seq
+                    block_tables = self.block_tables_buf[:bs, :max_num_blocks]
+                    _build_block_tables(
+                        self.req_to_token,
+                        req_pool_indices,
+                        block_tables,
+                        self.page_size,
+                        max_num_blocks,
+                    )
 
             if self.use_mla:
                 qo_indptr = self.qo_indptr_[: bs + 1]
@@ -1340,6 +1425,23 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 kv_indptr[: spec_info.kv_indptr.shape[0]] = spec_info.kv_indptr
                 kv_indices[: spec_info.kv_indices.shape[0]] = spec_info.kv_indices
+                # Rebuild block_tables for draft decode with block KV cache
+                if self.use_rocm_block_kv and not self.use_mla:
+                    decode_kv_lens = seq_lens[:bs] + 1
+                    context_lens = self.context_lens_buf[:bs]
+                    context_lens.copy_(decode_kv_lens.to(torch.int32))
+                    self.forward_metadata.context_lens = context_lens
+                    max_num_blocks = self.max_num_blocks_per_seq
+                    block_tables = self.block_tables_buf[:bs, :max_num_blocks]
+                    _build_block_tables(
+                        self.req_to_token,
+                        req_pool_indices[:bs],
+                        block_tables,
+                        self.page_size,
+                        max_num_blocks,
+                    )
+                    self.forward_metadata.block_tables = block_tables
+                    self.forward_metadata.max_context_len_val = self.max_context_len
 
         elif forward_mode.is_target_verify():
             bs = len(req_pool_indices)
@@ -1811,9 +1913,7 @@ class AiterAttnBackend(AttentionBackend):
             # v_cache: [num_blocks, kv_heads, head_dim, page_size]
 
             if self.forward_metadata.run_graph:
-                # CUDA graph mode: MTP=1 expanded batch — each query token is
-                # its own "sequence" with per-query context_lens for causal masking.
-                # This avoids MTP inner loop overhead and leverages L2 cache sharing.
+                # CUDA graph mode: use paged_attention_rocm with MTP causal masking.
                 bs = forward_batch.batch_size
                 mtp = self.num_draft_tokens
                 num_tokens = bs * mtp
@@ -2048,7 +2148,27 @@ class AiterAttnBackend(AttentionBackend):
             exp_sums = self.pa_rocm_exp_sums[:num_seqs]
             max_logits = self.pa_rocm_max_logits[:num_seqs]
 
-            if self.use_gluon_pa:
+            if self.use_aiter_gluon_pa:
+                _aiter_pa_decode_gluon(
+                    output=output,
+                    query=query,
+                    key_cache=k_cache,
+                    value_cache=v_cache,
+                    context_lengths=context_lens,
+                    block_tables=block_tables,
+                    softmax_scale=float(self.scale),
+                    query_length=1,
+                    max_context_partition_num=self.max_num_partitions,
+                    context_partition_size=self.gluon_partition_size,
+                    compute_type=self.input_dtype,
+                    query_scale=None,
+                    key_scale=None,
+                    value_scale=None,
+                    exp_sums=exp_sums,
+                    max_logits=max_logits,
+                    temporary_output=tmp_output,
+                )
+            elif self.use_gluon_pa:
                 paged_attention_decode(
                     output,
                     exp_sums,
