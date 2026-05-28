@@ -672,8 +672,14 @@ class EAGLEWorker(TpModelWorker):
             ).logits_output
             if self.server_args.enable_nan_detection:
                 detect_nan(logits_output)
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            if self.topk == 1:
+                topk_index = torch.argmax(
+                    logits_output.next_token_logits, dim=-1, keepdim=True
+                )
+                topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+            else:
+                probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
@@ -992,8 +998,18 @@ class EAGLEWorker(TpModelWorker):
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
-        probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-        draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
+        if self.topk == 1:
+            draft_input.topk_index = torch.argmax(
+                logits_output.next_token_logits, dim=-1, keepdim=True
+            )
+            draft_input.topk_p = torch.ones_like(
+                draft_input.topk_index, dtype=torch.float32
+            )
+        else:
+            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            draft_input.topk_p, draft_input.topk_index = fast_topk(
+                probs, self.topk, dim=-1
+            )
         draft_input.hidden_states = logits_output.hidden_states
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
